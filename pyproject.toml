@@ -1,7 +1,7 @@
 [project]
 name = "enrich"
 version = "0.1.0"
-description = "Lean account enrichment CLI: domains + titles -> accounts.csv + people.csv"
+description = "Account enrichment pipeline: domains + target titles -> company intel card (firmographics, funding, tech, hiring, mail gateway) + verified decision-maker emails, cached and cost-gated, optional Postgres mirror"
 requires-python = ">=3.12"
 dependencies = [
     "dnspython>=2.8.0",

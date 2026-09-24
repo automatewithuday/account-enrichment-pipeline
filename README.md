@@ -1,6 +1,6 @@
 # Account Enrichment Pipeline
 
-Give it a CSV of company domains and the job titles you sell to. It returns one row of company intel per domain and one row per matching decision-maker with a verified work email, at a few cents per account, and never pays twice for the same data.
+Give it a CSV of company domains and the job titles you sell to. It returns one row of company intel per domain, including which email security gateway sits in front of the inbox, and one row per matching decision-maker with a verified work email, at a few cents per account. It never pays twice for the same data, and can mirror everything into a Postgres database.
 
 ```
 domains.csv + "VP Sales,Chief Revenue,Founder,CEO"
