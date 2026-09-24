@@ -18,6 +18,7 @@ domains.csv + "VP Sales,Chief Revenue,Founder,CEO"
 | Group | Columns |
 |---|---|
 | Identity | company_name, website, linkedin_url, tagline, description, industry, specialities, categories, company_type, hq, country, founded_year |
+| Mail routing | seg_vendor (security gateway in front of the inbox: proofpoint, mimecast, barracuda, cisco, ... or none), mailbox_provider (google, microsoft, zoho, other), mx_hosts |
 | Size & growth | employee_count, employee_count_range, headcount_growth_6m_pct, headcount_growth_12m_pct, linkedin_followers |
 | Revenue & funding | revenue_estimate_low_usd, revenue_estimate_high_usd, funding_total_usd, last_round_type, last_round_amount_usd, last_round_date, investors |
 | Tech stack | tech_stack (current), tech_stale (not seen in 180 days), tech_last_detected |
@@ -31,7 +32,7 @@ domains.csv + "VP Sales,Chief Revenue,Founder,CEO"
 |---|---|
 | Person | first_name, last_name, title, linkedin_url, source |
 | Email | email, email_status (verified live), email_domain, email_verified_at |
-| Mail routing | mx_provider, mx_gateway, mx_gateway_type (mailbox host vs security gateway, for campaign splitting) |
+| Mail routing | mx_provider, mx_security_gateway (true when a gateway sits in front), mx_gateway_type |
 
 Rows are never dropped. Every blank data column has a sibling `*_miss_reason` that says why it is blank (`no_jobs`, `no_email`, `domain_mismatch:bit.ly`, `http_403`, ...).
 
@@ -51,6 +52,7 @@ accounts.csv
 | revenue_estimate_low_usd / high | 20000000 / 50000000 |
 | funding_total_usd | 31500000 |
 | last_round_type / amount / date | Series B / 22000000 / 2025-03-14 |
+| seg_vendor / mailbox_provider | proofpoint / microsoft |
 | tech_stack | React;Next.js;Amazon CloudFront;Google Tag Manager;HubSpot;... |
 | jobs_total | 14 |
 | job_titles | Enterprise Account Executive;SDR Manager;Head of Demand Generation;... |
@@ -61,26 +63,27 @@ accounts.csv
 
 people.csv
 
-| first_name | last_name | title | email | email_status | mx_provider | mx_gateway_type |
+| first_name | last_name | title | email | email_status | mx_provider | mx_security_gateway |
 |---|---|---|---|---|---|---|
-| Jane | Doe | VP Sales | jane@acme.io | valid | google workspace | Cloud Mailbox Host |
-| Raj | Patel | Chief Revenue Officer | raj@acme.io | valid | google workspace | Cloud Mailbox Host |
+| Jane | Doe | VP Sales | jane@acme.io | valid | microsoft 365 | true |
+| Raj | Patel | Chief Revenue Officer | raj@acme.io | valid | microsoft 365 | true |
 
 ## The pipeline
 
-Nine steps per domain, cheapest first. Each later step overwrites what an earlier one guessed.
+Ten steps per domain, cheapest first. Each later step overwrites what an earlier one guessed.
 
 ```
  1. baseline lookup          free   coarse name / industry / size for all domains in one call
- 2. LinkedIn URL resolution  free   homepage footer link > batched identify > company record > baseline
- 3. company record           paid   funding, revenue estimate, headcount growth, categories, investors
-    └─ funding fallback      paid   funding rounds by website, only when step 3 has no funding block
- 4. company profile scrape   paid   name, industry, headcount, HQ, founded, description, followers (source of truth)
- 5. tech stack               paid   technologies with last-detected dates; stale ones split out
- 6. job postings             paid   open postings, titles, newest date; postings for other companies are filtered out
- 7. titles at company        free   every title held at the company, your targets first
- 8. people search            free   contacts matching your titles; tries legacy / alias domains when the input domain is empty
- 9. email finder             paid   verified work email + mail routing, billed only on a hit
+ 2. mail routing (DNS)       free   MX records -> security gateway vendor + mailbox provider, before any paid step
+ 3. LinkedIn URL resolution  free   homepage footer link > batched identify > company record > baseline
+ 4. company record           paid   funding, revenue estimate, headcount growth, categories, investors
+    └─ funding fallback      paid   funding rounds by website, only when step 4 has no funding block
+ 5. company profile scrape   paid   name, industry, headcount, HQ, founded, description, followers (source of truth)
+ 6. tech stack               paid   technologies with last-detected dates; stale ones split out
+ 7. job postings             paid   open postings, titles, newest date; postings for other companies are filtered out
+ 8. titles at company        free   every title held at the company, your targets first
+ 9. people search            free   contacts matching your titles; tries legacy / alias domains when the input domain is empty
+10. email finder             paid   verified work email + per-person gateway flag, billed only on a hit
 ```
 
 Every step runs against a provider you configure in `.env`. A missing provider key does not stop the run; the affected columns carry a miss reason.
@@ -127,5 +130,6 @@ With `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in `.env`, every run also upserts
 - Never pay twice: every response is cached, errors are never cached, and changing a request re-bills only that request.
 - Never drop a row: blanks always carry a reason.
 - Cheapest source first, most trusted source last.
-- Single module, no framework, two dependencies (`httpx`, `python-dotenv`). Python via `uv`.
+- Single module, no framework, three dependencies (`httpx`, `python-dotenv`, `dnspython`). Python via `uv`.
+- The gateway map (`gateway-map.json`) is data, not code: add an MX suffix there when a new gateway shows up as `unknown`.
 - Secrets live in `.env` only.

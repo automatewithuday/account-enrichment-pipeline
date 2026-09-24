@@ -25,6 +25,7 @@ DEBUG = os.getenv("DEBUG") == "1"
 SB_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SB_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ACTOR = "harvestapi~linkedin-job-search"
+GATEWAY_MAP = json.loads((Path(__file__).parent / "gateway-map.json").read_text())  # MX suffixes -> security gateway / mailbox provider
 LI_COMPANY = re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/([A-Za-z0-9._%-]+)", re.I)
 PRICE_DL = {"crustdata_v3_company_search": 0.02, "leadmagic_email_finder": 0.34}  # credits per returned result; everything else free
 CACHE_PATH = Path(".cache/calls.jsonl")
@@ -42,12 +43,13 @@ ACCOUNT_COLS = [
     "domain", "company_source", "company_name", "linkedin_url", "linkedin_url_source", "website", "tagline", "description", "industry", "specialities", "categories", "company_type",
     "employee_count", "employee_count_range", "headcount_growth_6m_pct", "headcount_growth_12m_pct",
     "hq", "country", "founded_year", "revenue_estimate_low_usd", "revenue_estimate_high_usd", "linkedin_followers", "company_miss_reason", "linkedin_miss_reason",
+    "seg_vendor", "mailbox_provider", "mx_hosts", "seg_miss_reason",
     "funding_total_usd", "last_round_type", "last_round_amount_usd", "last_round_date", "investors", "funding_source", "funding_miss_reason",
     "tech_stack", "tech_stale", "tech_last_detected", "tech_miss_reason", "openings_count", "openings_growth_pct", "jobs_total", "jobs_newest_posted", "job_titles", "jobs_miss_reason",
     "titles_at_company", "titles_miss_reason", "title_matches", "people_miss_reason", "crustdata_updated_at", "data_as_of", "deepline_cr", "apify_usd", "builtwith_cr",
 ]
 PEOPLE_COLS = ["domain", "company_name", "first_name", "last_name", "title", "linkedin_url", "source",
-               "email", "email_status", "email_domain", "mx_provider", "mx_gateway", "mx_gateway_type", "email_verified_at", "email_miss_reason"]
+               "email", "email_status", "email_domain", "mx_provider", "mx_security_gateway", "mx_gateway_type", "email_verified_at", "email_miss_reason"]
 
 
 def log(*a):
@@ -248,6 +250,58 @@ def builtwith(domain):
     return {"tech": tech}
 
 
+def dns_query(domain, rtype):
+    """MX -> [(pref, host)], TXT -> [str]. Raises dns.resolver errors; caller maps them to statuses."""
+    import dns.resolver  # ponytail: lazy import keeps the module importable without the DNS dependency for the offline self-check
+    r = dns.resolver.Resolver()
+    r.lifetime = 4.0
+    ans = r.resolve(domain, rtype)
+    if rtype == "MX":
+        return sorted((a.preference, str(a.exchange).rstrip(".").lower()) for a in ans)
+    return [b"".join(a.strings).decode(errors="ignore").lower() for a in ans]
+
+
+def suffix_match(host, table, key):
+    best, best_len = None, 0
+    for name, entry in table.items():
+        for suf in entry[key]:
+            if (host == suf or host.endswith("." + suf)) and len(suf) > best_len:
+                best, best_len = name, len(suf)
+    return best
+
+
+def classify_mx(hosts, spf):
+    """Gateway = first MX host (preference order) matching a gateway suffix; mailbox from MX when direct, else from SPF include."""
+    seg = next((v for h in hosts if (v := suffix_match(h, GATEWAY_MAP["gateways"], "suffixes"))), None)
+    prov = None if seg else next((p for h in hosts if (p := suffix_match(h, GATEWAY_MAP["mailbox_providers"], "mx_suffixes"))), None)
+    if not prov:
+        prov = next((p for p, e in GATEWAY_MAP["mailbox_providers"].items() if any(f"include:{i}" in spf for i in e["spf_includes"])), None)
+    return {"seg_vendor": seg or ("none" if prov else "unknown"), "mailbox_provider": prov or "other", "mx_hosts": "|".join(hosts)}
+
+
+def mail_gateway(d):
+    """Free: what sits in front of the domain's inbox. nxdomain/no_mx/null_mx are definitive and cached; timeouts are errors and retried next run."""
+    def fn(key):
+        import dns.exception
+        import dns.resolver
+        try:
+            hosts = [h for _, h in dns_query(d, "MX")]
+        except dns.resolver.NXDOMAIN:
+            return {"raw": {"status": "nxdomain"}, "_cost": 0.0}
+        except dns.resolver.NoAnswer:
+            return {"raw": {"status": "no_mx"}, "_cost": 0.0}
+        except (dns.exception.Timeout, dns.resolver.NoNameservers, dns.resolver.LifetimeTimeout) as e:
+            return {"error": f"dns_{type(e).__name__.lower()}"}
+        if hosts in ([""], ["."]):
+            return {"raw": {"status": "null_mx", "mx_hosts": ""}, "_cost": 0.0}
+        try:
+            spf = next((t for t in dns_query(d, "TXT") if t.startswith("v=spf1")), "")
+        except Exception:  # SPF is a fallback signal only; any TXT failure just means "no SPF"
+            spf = ""
+        return {"raw": {"status": "ok", "spf": spf} | classify_mx(hosts, spf), "_cost": 0.0}
+    return cached("dns", "mx_lookup", {"domain": d}, fn)
+
+
 def linkedin_from_site(d):
     """Free and precise: the company's own homepage usually links its LinkedIn page."""
     def fn(key):
@@ -297,6 +351,12 @@ def enrich_domain(d, titles, base, ident, max_people):
     a["linkedin_url_source"] = "free_table" if a["linkedin_url"] else None
     if a["linkedin_url"] and not a["linkedin_url"].startswith("http"):
         a["linkedin_url"] = "https://www." + a["linkedin_url"].removeprefix("www.")
+
+    mx = mail_gateway(d)  # free DNS, before any paid step: gateway vendor + mailbox provider per company
+    if mx.get("error") or (mx.get("raw") or {}).get("status") != "ok":
+        a["seg_miss_reason"] = mx.get("error") or (mx.get("raw") or {}).get("status") or "no_mx"
+    else:
+        a.update({k: mx["raw"][k] for k in ("seg_vendor", "mailbox_provider", "mx_hosts")})
 
     resp = deepline("crustdata_v3_company_search", {"filters": {"field": "basic_info.primary_domain", "type": "=", "value": d}, "limit": 1})
     rows = rows_of(resp.get("raw"), "companies")
@@ -450,7 +510,7 @@ def enrich_domain(d, titles, base, ident, max_people):
         em = get(resp, "raw.data") or {}
         if em.get("email"):
             r.update(email=em["email"], email_status=em.get("status"), email_domain=dom, mx_provider=em.get("mx_provider"),
-                     mx_gateway=em.get("mx_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
+                     mx_security_gateway=em.get("mx_security_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
         else:
             r["email_miss_reason"] = resp.get("error") or "no_email"
 

@@ -10,6 +10,7 @@ create table if not exists companies (
   employee_count integer, employee_count_range text, headcount_growth_6m_pct numeric, headcount_growth_12m_pct numeric,
   hq text, country text, founded_year integer, revenue_estimate_low_usd numeric, revenue_estimate_high_usd numeric, linkedin_followers integer,
   company_miss_reason text, linkedin_miss_reason text,
+  seg_vendor text, mailbox_provider text, mx_hosts text, seg_miss_reason text,   -- free DNS: security gateway in front of the inbox (proofpoint, mimecast, ..., none, unknown) and mailbox host
   funding_total_usd numeric, last_round_type text, last_round_amount_usd numeric, last_round_date date, investors text, funding_miss_reason text,
   tech_stack text, tech_stale text, tech_last_detected date, tech_miss_reason text,
   openings_count integer, openings_growth_pct numeric, jobs_total integer, jobs_newest_posted date, job_titles text, jobs_miss_reason text,
@@ -24,7 +25,7 @@ create table if not exists people (
   id text primary key,                   -- LinkedIn profile URL, else domain|first|last
   domain text not null references companies(domain) on delete cascade,
   company_name text, first_name text, last_name text, title text, linkedin_url text,
-  email text, email_status text, email_domain text, mx_provider text, mx_gateway text, mx_gateway_type text, email_verified_at date, email_miss_reason text,
+  email text, email_status text, email_domain text, mx_provider text, mx_security_gateway boolean, mx_gateway_type text, email_verified_at date, email_miss_reason text,
   last_enriched_at timestamptz,          -- newest of the person's people-search page and email lookup; skip re-verifying inside your window
   run_id text,
   updated_at timestamptz not null default now()
@@ -60,3 +61,7 @@ alter table raw_responses enable row level security;
 alter table companies drop column if exists company_source, drop column if exists linkedin_url_source, drop column if exists funding_source,
   drop column if exists crustdata_updated_at, drop column if exists deepline_cr, drop column if exists apify_usd, drop column if exists builtwith_cr;  -- legacy column names
 alter table people drop column if exists source;
+
+-- Migration 2026-09-25 (b): company-level mail gateway columns; people.mx_gateway replaced by the boolean (the name field also labels plain Google/Microsoft).
+alter table companies add column if not exists seg_vendor text, add column if not exists mailbox_provider text, add column if not exists mx_hosts text, add column if not exists seg_miss_reason text;
+alter table people drop column if exists mx_gateway, add column if not exists mx_security_gateway boolean;

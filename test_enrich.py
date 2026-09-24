@@ -16,6 +16,11 @@ assert e.rows_of({"result": {"data": {"rows": [1, 2]}}}) == [1, 2]
 assert e.rows_of({"data": {"status": "ok", "output": {"titles": ["a"]}}}, "titles") == ["a"]
 assert e.get({"a": {"b": 0}}, "a.b") == 0 and e.get({"a": {}}, "a.b", "c") is None
 
+# mail gateway classification from MX hosts (+ SPF fallback for a mailbox behind a gateway); DNS failures are errors, never cached
+assert e.classify_mx(["mx0a-00123.pphosted.com", "mx0b-00123.pphosted.com"], "v=spf1 include:spf.protection.outlook.com -all") == {"seg_vendor": "proofpoint", "mailbox_provider": "microsoft", "mx_hosts": "mx0a-00123.pphosted.com|mx0b-00123.pphosted.com"}
+assert e.classify_mx(["aspmx.l.google.com"], "") == {"seg_vendor": "none", "mailbox_provider": "google", "mx_hosts": "aspmx.l.google.com"}
+assert e.classify_mx(["mail.selfhosted.io"], "")["seg_vendor"] == "unknown" and e.classify_mx(["mail.selfhosted.io"], "")["mailbox_provider"] == "other"
+
 # cache: second call with same payload never invokes fn; errors are not cached
 e.CACHE_PATH = Path(tempfile.mkdtemp()) / "calls.jsonl"
 calls = []
@@ -46,7 +51,7 @@ LEADS = {"leads": [{"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", 
                    {"firstName": "Bob", "lastName": "Ray", "title": "Engineer"}]}
 BW = {"data": {"Results": [{"Lookup": "acme.com", "Result": {"Paths": [{"Technologies": [{"Name": "React", "Tag": "js"}, {"Name": "React", "Tag": "js"}, {"Name": "jQuery", "LastDetected": 1000000000000}]}]}}]}}
 AVIATO = {"data": {"fundingRounds": [{"announcedOn": "2020-02-25T00:00:00.000Z", "moneyRaised": 306066, "stage": "Seed"}, {"announcedOn": "2022-05-04T00:00:00.000Z", "moneyRaised": 14300000, "stage": "Series A"}]}}
-EMAIL = {"data": {"email": "ann@acme.com", "status": "valid", "mx_provider": "google workspace", "mx_gateway": "Google Workspace", "mx_gateway_type": "Cloud Mailbox Host", "processed_at": "2026-09-25T01:02:03Z"}}
+EMAIL = {"data": {"email": "ann@acme.com", "status": "valid", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "processed_at": "2026-09-25T01:02:03Z"}}
 def fake_deepline(tool, payload, backend="deepline"):
     return {"raw": {"crustdata_v3_company_search": CRUST, "company_titles": {"titles": ["VP Sales", "Engineer"]},
                     "dropleads_search_people": LEADS, "builtwith_domain_lookup": BW, "aviato_get_company_funding_rounds": AVIATO, "leadmagic_email_finder": EMAIL}[tool]}
@@ -55,6 +60,7 @@ e.apify_company = lambda url: {"items": [{"name": "Acme Inc", "employeeCount": 1
     "industries": [{"name": "Software Development"}], "foundedOn": {"year": 2014}, "followerCount": 10, "companyType": "Privately Held",
     "locations": [{"city": "Denver", "geographicArea": "Colorado", "country": "US"}, {"city": "Austin", "geographicArea": "Texas", "country": "US", "headquarter": True}]}]}
 e.linkedin_from_site = lambda d: {"slug": "acme-inc"} if d == "acme.com" else {"slug": None}
+e.mail_gateway = lambda d: {"raw": {"status": "ok", "seg_vendor": "mimecast", "mailbox_provider": "google", "mx_hosts": "us-smtp-inbound-1.mimecast.com"}}
 LI = "https://www.linkedin.com/company/acme-inc"
 e.apify_jobs = lambda url, max_items=10: {"items": [{"title": "AE", "postedDate": "2026-09-01T00:00:00Z", "company": {"linkedinUrl": LI + "/", "website": "https://acme-legacy.io/?utm=x"}, "_meta": {"pagination": {"totalElements": 41}}},
     {"title": "X", "company": {"linkedinUrl": "https://www.linkedin.com/company/other", "website": "https://acme.com"}}], "capped": True}
@@ -66,8 +72,9 @@ assert a["funding_total_usd"] == 5e6 and a["funding_source"] == "crustdata" and 
 assert a["jobs_total"] == 41 and a["job_titles"] == "AE" and a["jobs_newest_posted"] == "2026-09-01"
 assert a["tech_stack"] == "React (js)" and a["tech_stale"] == "jQuery" and a["tech_last_detected"] == "2001-09-09" and a["crustdata_updated_at"] == "2026-09-24"
 assert a["titles_at_company"] == "VP Sales;Engineer" and a["title_matches"] == 1
+assert a["seg_vendor"] == "mimecast" and a["mailbox_provider"] == "google" and "seg_miss_reason" not in a
 assert ps == [{"domain": "acme.com", "company_name": "Acme Inc", "first_name": "Ann", "last_name": "Lee", "title": "VP Sales", "linkedin_url": "li/ann", "source": "dropleads",
-               "id": "li/ann", "last_enriched_at": None, "email": "ann@acme.com", "email_status": "valid", "email_domain": "acme.com", "mx_provider": "google workspace", "mx_gateway": "Google Workspace", "mx_gateway_type": "Cloud Mailbox Host", "email_verified_at": "2026-09-25"}]
+               "id": "li/ann", "last_enriched_at": None, "email": "ann@acme.com", "email_status": "valid", "email_domain": "acme.com", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "email_verified_at": "2026-09-25"}]
 assert not any(k.endswith("miss_reason") for k in a)
 a2, _ = e.enrich_domain("acme.com", ["vp sales"], {"acme.com": {"_shared": 40}}, {}, 5)
 assert a2["company_miss_reason"] == "shared_domain:40_companies" and a2["company_name"] == "Acme Inc"
@@ -134,7 +141,9 @@ assert ps4[0]["email_miss_reason"] == "no_email" and "email" not in ps4[0]
 # misses carry reasons; zero openings skips the paid jobs call
 e.deepline = lambda tool, payload, backend="deepline": {"error": "http_401"} if tool != "crustdata_v3_company_search" else {"raw": {"companies": [{"basic_info": {"name": "Z"}, "hiring": {"openings_count": 0}}]}}
 e.apify_jobs = lambda *a, **k: (_ for _ in ()).throw(AssertionError("apify must not be called"))
+e.mail_gateway = lambda d: {"error": "dns_lifetimetimeout"}
 a, ps = e.enrich_domain("z.com", ["ceo"], {}, {}, 5)
+assert a["seg_miss_reason"] == "dns_lifetimetimeout" and "seg_vendor" not in a
 assert a["jobs_miss_reason"] == "no_openings" and a["funding_miss_reason"] == "http_401" and a["linkedin_miss_reason"] == "no_linkedin_url"
 assert a["tech_miss_reason"] == "http_401" and a["titles_miss_reason"] == "http_401" and a["people_miss_reason"] == "http_401"
 assert ps == [] and a["title_matches"] == 0
