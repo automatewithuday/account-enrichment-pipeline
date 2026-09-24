@@ -1,0 +1,6 @@
+[project]
+name = "enrich"
+version = "0.1.0"
+description = "Lean account enrichment CLI: domains + titles -> accounts.csv + people.csv"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.27", "python-dotenv>=1.0"]
