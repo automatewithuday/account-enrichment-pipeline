@@ -53,7 +53,7 @@ ACCOUNT_COLS = [
     "titles_at_company", "titles_miss_reason", "title_matches", "people_miss_reason", "crustdata_updated_at", "data_as_of", "deepline_cr", "apify_usd", "builtwith_cr", "bettercontact_cr",
 ]
 PEOPLE_COLS = ["domain", "company_name", "first_name", "last_name", "title", "linkedin_url", "source",
-               "email", "email_status", "email_domain", "mx_provider", "mx_security_gateway", "mx_gateway_type", "email_verified_at", "email_miss_reason",
+               "email", "email_status", "email_catch_all", "email_domain", "mx_provider", "mx_security_gateway", "mx_gateway_type", "email_verified_at", "email_miss_reason",
                "mobile", "mobile_cc", "mobile_status", "mobile_source", "do_not_contact", "mobile_miss_reason"]
 
 
@@ -598,7 +598,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         resp = deepline("leadmagic_email_finder", {"first_name": r["first_name"], "last_name": r["last_name"], "domain": dom})
         em = get(resp, "raw.data") or {}
         if em.get("email"):
-            r.update(email=em["email"], email_status=em.get("status"), email_domain=em["email"].rsplit("@", 1)[-1].lower(), mx_provider=em.get("mx_provider"),
+            r.update(email=em["email"], email_status=em.get("status"), email_catch_all=em.get("is_domain_catch_all", em.get("status") == "valid_catch_all"), email_domain=em["email"].rsplit("@", 1)[-1].lower(), mx_provider=em.get("mx_provider"),
                      mx_security_gateway=em.get("mx_security_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
             if em.get("status") not in ("valid", "valid_catch_all"):  # provider enum: valid | valid_catch_all | not_found; anything else is kept but flagged as not outreach-ready
                 r["email_miss_reason"] = f"status_{em.get('status') or 'unknown'}"

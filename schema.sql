@@ -25,7 +25,7 @@ create table if not exists people (
   id text primary key,                   -- LinkedIn profile URL, else domain|first|last
   domain text not null references companies(domain) on delete cascade,
   company_name text, first_name text, last_name text, title text, linkedin_url text,
-  email text, email_status text, email_domain text, mx_provider text, mx_security_gateway boolean, mx_gateway_type text, email_verified_at date, email_miss_reason text,
+  email text, email_status text, email_catch_all boolean, email_domain text, mx_provider text, mx_security_gateway boolean, mx_gateway_type text, email_verified_at date, email_miss_reason text,
   mobile text, mobile_cc text, mobile_status text, do_not_contact boolean, mobile_miss_reason text,   -- --mobile runs only; do_not_contact is the provider's opt-out flag, honour it
   last_enriched_at timestamptz,          -- newest fetch among the lookups the last run used for this row (people search, email, optional mobile); can move backwards on a partial rerun. Use email_verified_at to schedule email re-verification
   run_id text,
@@ -70,3 +70,6 @@ alter table people drop column if exists mx_gateway, add column if not exists mx
 -- Migration 2026-09-25 (c): per-contact mobile columns for --mobile runs (idempotent).
 alter table people add column if not exists mobile text, add column if not exists mobile_cc text, add column if not exists mobile_status text,
   add column if not exists do_not_contact boolean, add column if not exists mobile_miss_reason text;
+
+-- Migration 2026-09-26: per-contact catch-all flag (the provider's is_domain_catch_all; email_status also reads valid_catch_all).
+alter table people add column if not exists email_catch_all boolean;

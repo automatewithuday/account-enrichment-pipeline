@@ -51,7 +51,7 @@ LEADS = {"leads": [{"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", 
                    {"firstName": "Bob", "lastName": "Ray", "title": "Engineer"}]}
 BW = {"data": {"Results": [{"Lookup": "acme.com", "Result": {"Paths": [{"Technologies": [{"Name": "React", "Tag": "js"}, {"Name": "React", "Tag": "js"}, {"Name": "jQuery", "LastDetected": 1000000000000}]}]}}]}}
 AVIATO = {"data": {"fundingRounds": [{"announcedOn": "2020-02-25T00:00:00.000Z", "moneyRaised": 306066, "stage": "Seed"}, {"announcedOn": "2022-05-04T00:00:00.000Z", "moneyRaised": 14300000, "stage": "Series A"}]}}
-EMAIL = {"data": {"email": "ann@acme.com", "status": "valid", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "processed_at": "2026-09-25T01:02:03Z"}}
+EMAIL = {"data": {"email": "ann@acme.com", "status": "valid", "is_domain_catch_all": False, "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "processed_at": "2026-09-25T01:02:03Z"}}
 MOBILE = {"id": "req1", "status": "terminated", "data": [{"contact_phone_number": "+15550001234", "contact_phone_number_cc": "US", "contact_phone_number_status": "not_validated", "contact_phone_number_provider": "vendor-x", "do_not_contact": False, "contact_email_address": "other@acme.com"}]}
 def fake_deepline(tool, payload, backend="deepline", check=None):
     return {"raw": {"crustdata_v3_company_search": CRUST, "company_titles": {"titles": ["VP Sales", "Engineer"]},
@@ -76,7 +76,7 @@ assert a["tech_stack"] == "React (js)" and a["tech_stale"] == "jQuery" and a["te
 assert a["titles_at_company"] == "VP Sales;Engineer" and a["title_matches"] == 1
 assert a["seg_vendor"] == "mimecast" and a["mailbox_provider"] == "google" and "seg_miss_reason" not in a
 assert ps == [{"domain": "acme.com", "company_name": "Acme Inc", "first_name": "Ann", "last_name": "Lee", "title": "VP Sales", "linkedin_url": "li/ann", "source": "dropleads",
-               "id": "li/ann", "last_enriched_at": None, "email": "ann@acme.com", "email_status": "valid", "email_domain": "acme.com", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "email_verified_at": "2026-09-25"}]
+               "id": "li/ann", "last_enriched_at": None, "email": "ann@acme.com", "email_status": "valid", "email_catch_all": False, "email_domain": "acme.com", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "email_verified_at": "2026-09-25"}]
 assert not any(k.endswith("miss_reason") for k in a)
 assert "mobile" not in ps[0] and "mobile_miss_reason" not in ps[0]  # mobile is opt-in
 # direct phone finder: POST launches, GET polls until status=terminated; 10 credits per phone found, cached under the launch payload
@@ -226,7 +226,8 @@ assert ps11[0]["email"] == "ann@other.test" and ps11[0]["email_miss_reason"] == 
 assert ps11[0]["do_not_contact"] is True and ps11[0]["mobile_miss_reason"] == "no_mobile" and "mobile" not in ps11[0]
 EMAIL["data"].update(email="ann@acme.com", status="valid_catch_all")  # the provider's catch-all spelling is a hit, not a flag
 _, ps11b = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 1)
-assert ps11b[0]["email_status"] == "valid_catch_all" and "email_miss_reason" not in ps11b[0]
+assert ps11b[0]["email_status"] == "valid_catch_all" and ps11b[0]["email_catch_all"] is False and "email_miss_reason" not in ps11b[0]  # the provider boolean wins over the status when both are present
+EMAIL["data"].pop("is_domain_catch_all"); _, ps11c = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 1); assert ps11c[0]["email_catch_all"] is True; EMAIL["data"]["is_domain_catch_all"] = False
 EMAIL["data"].update(status="valid")
 # F02 + F15: without --mobile the mobile columns are not sent at all (never nulled); the same person under two domains is one upsert row
 writes.clear()
