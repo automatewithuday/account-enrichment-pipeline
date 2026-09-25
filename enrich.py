@@ -171,26 +171,34 @@ def db_write(accounts, people, run_id, mobile=True):
     Without --mobile the mobile columns are left out of the upsert entirely, so a plain rerun never nulls numbers or opt-out flags bought earlier.
     People are deduped by id (one person under two input domains would otherwise hit the same key twice in one statement)."""
     clean = lambda row: {k: (None if v == "" else v) for k, v in row.items() if k not in DB_HIDE}
-    pcols = [c for c in PEOPLE_COLS if mobile or c not in MOBILE_COLS] + ["id", "last_enriched_at"]
     people = list({p["id"]: p for p in people}.values())
     nc = db_upsert("companies", [clean({k: a.get(k) for k in ACCOUNT_COLS + ["last_enriched_at"]} | {"run_id": run_id}) for a in accounts], "domain")
-    np_ = db_upsert("people", [clean({k: p.get(k) for k in pcols} | {"run_id": run_id}) for p in people], "id")
+    np_ = 0
+    for with_mobile in (True, False):  # two uniform groups: rows with a conclusive mobile answer carry the mobile columns, the rest leave them untouched
+        group = [p for p in people if bool(mobile and p.get("mobile_checked", True)) == with_mobile]
+        pcols = [c for c in PEOPLE_COLS if with_mobile or c not in MOBILE_COLS] + ["id", "last_enriched_at"]
+        if group:
+            np_ += db_upsert("people", [clean({k: p.get(k) for k in pcols} | {"run_id": run_id}) for p in group], "id")
     nr = db_upsert("raw_responses", [r | {"run_id": run_id} for r in {r["cache_key"]: r for r in RAW}.values()], "cache_key")
     return f"companies {nc}, people {np_}, raw {nr}"
 
 
-def request(label, method, url, retry_transport=True, **kw):
+def request(label, method, url, launch=False, **kw):
     """4 attempts on 429/409/5xx/transport errors; returns Response or None when exhausted.
-    retry_transport=False for launches without an idempotency key: a read timeout after the server accepted would otherwise start (and bill) a second job."""
+    launch=True for job launches without an idempotency key: only 429/409 (nothing was created) are retried; a 5xx or a read timeout after the
+    server accepted the job would otherwise start (and bill) a second one."""
     for i in range(4):
         try:
             r = httpx.request(method, url, **kw)
             if r.status_code not in (429, 409) and r.status_code < 500:
                 return r
             err = f"http_{r.status_code}"
+            if launch and r.status_code >= 500:
+                log("no retry", label, err)
+                return r
         except httpx.TransportError as e:
             err = f"transport:{type(e).__name__}"
-            if not retry_transport:
+            if launch:
                 log("no retry", label, err)
                 return None
         log("retry", label, err)
@@ -223,6 +231,8 @@ def deepline(tool, payload, backend="deepline", check=None):
         if not isinstance(body, dict):
             return {"error": "bad_json"}
         raw = get(body, "toolResponse.raw", "result")
+        if raw is None:  # 200 with no result is the gateway's own error envelope; never cache it as an empty answer
+            return {"error": "no_result:" + str(body.get("error") or body.get("message") or "")[:80]}
         if check and (err := check(raw)):
             return {"error": err}
         billing = body.get("billing")
@@ -238,7 +248,7 @@ def apify(actor, payload, per_item_usd, start_usd=0.001, **params):
     def fn(key):
         if not APIFY_TOKEN:
             return {"error": "no_apify_token"}
-        r = request("apify", "POST", f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items", retry_transport=False,  # a re-launch re-bills
+        r = request("apify", "POST", f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items", launch=True,  # a re-launch re-bills
                     params={"token": APIFY_TOKEN, "clean": "true", **params}, json=payload, timeout=320)  # the platform hard-fails sync runs at 300s
         if r is None:
             return {"error": "http_5xx_exhausted"}
@@ -262,7 +272,7 @@ def bettercontact(payload):
         if not BC_KEY:
             return {"error": "no_bettercontact_key"}
         h = {"X-API-Key": BC_KEY}
-        r = request("bettercontact", "POST", BC_URL, json=payload, headers=h, timeout=60, retry_transport=False)  # no idempotency key: never re-launch blind
+        r = request("bettercontact", "POST", BC_URL, json=payload, headers=h, timeout=60, launch=True)  # no idempotency key: never re-launch blind
         raw = {}
         for i in range(26):  # launch + 25 polls at 5 s; 202 with no data while running, 200 + status=terminated when done; every response is inspected
             if i:
@@ -466,15 +476,18 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         a["funding_source"] = "crustdata"
     else:
         resp = deepline("aviato_get_company_funding_rounds", {"website": d, "perPage": 20, "page": 0})  # ponytail: first 20 rounds only; paginate if a company ever has more
-        rounds = [r for r in rows_of(resp.get("raw"), "fundingRounds") if r.get("announcedOn")]
+        all_rounds = rows_of(resp.get("raw"), "fundingRounds")
+        rounds = [r for r in all_rounds if r.get("announcedOn")]
         if rounds:
             last = max(rounds, key=lambda r: r["announcedOn"])
-            known = all(isinstance(r.get("moneyRaised"), (int, float)) for r in rounds)  # an undisclosed round makes the total unknown, not smaller
-            a.update({"funding_source": "aviato", "funding_total_usd": sum(r["moneyRaised"] for r in rounds) if known else None, "last_round_type": last.get("stage"),
+            known = all(isinstance(r.get("moneyRaised"), (int, float)) for r in all_rounds)  # an undisclosed round (dated or not) makes the total unknown, not smaller
+            a.update({"funding_source": "aviato", "funding_total_usd": sum(r["moneyRaised"] for r in all_rounds) if known else None, "last_round_type": last.get("stage"),
                       "last_round_amount_usd": last.get("moneyRaised"), "last_round_date": last["announcedOn"][:10]})
             a.pop("funding_miss_reason", None)
             if not known:
                 a["funding_miss_reason"] = "undisclosed_amounts"
+            elif len(all_rounds) >= 20:
+                a["funding_miss_reason"] = "possibly_partial:20_rounds"  # a full page says nothing about round 21; the total stands but may be low
         else:
             a["funding_miss_reason"] = a.get("funding_miss_reason") or resp.get("error") or "not_available"
 
@@ -533,7 +546,8 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
             items = [j for j in resp["items"] if (get(j, "company.linkedinUrl") or "").lower().rstrip("/") in ("", want)]  # drop wrong-company hits
             aliases.update(norm_domain(get(j, "company.website")) for j in items if get(j, "company.linkedinUrl"))  # only a verified company's site may seed the people search
             total = get(resp["items"][0], "_meta.pagination.totalElements") if resp["items"] else None  # true 30-day count, all postings
-            a["jobs_total"] = total if isinstance(total, int) else len(items)  # integer always (schema column); a capped fetch without the total is a lower bound
+            if items:  # the provider total is only meaningful when at least one posting is verifiably this company's
+                a["jobs_total"] = total if isinstance(total, int) else len(items)  # integer always (schema column); a capped fetch without the total is a lower bound
             a["jobs_newest_posted"] = max(((j.get("postedDate") or "")[:10] for j in items), default=None) or None
             a["job_titles"] = ";".join(dict.fromkeys(j.get("title") for j in items if j.get("title"))) or None  # newest first, up to JOBS_MAX
             if not items:
@@ -572,7 +586,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         a["people_miss_reason"] = "no_title_match"
     rows = [{"domain": d, "company_name": a.get("company_name"), "first_name": p.get("firstName"), "last_name": p.get("lastName"),
              "title": p.get("title"), "linkedin_url": p.get("linkedinUrl"), "source": "dropleads" if dom == d else f"dropleads:{dom}",
-             "id": p.get("linkedinUrl") or f"{d}|{p.get('firstName')}|{p.get('lastName')}"} for p in people]
+             "id": (p.get("linkedinUrl") or "").lower().rstrip("/") or f"{d}|{p.get('firstName')}|{p.get('lastName')}"} for p in people]
     found_ts = [ts for _, _, _, ts in SPENT[pstart:] if ts]
     for r in rows:  # email finder: 0.34 cr on a verified hit, free on a miss; keyed by the domain the person was found under (rebrands miss on the input domain)
         n = len(SPENT)
@@ -589,6 +603,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
             contact = {"first_name": r["first_name"], "last_name": r["last_name"], "company_domain": dom} | ({"linkedin_url": r["linkedin_url"]} if r.get("linkedin_url") else {})
             resp = bettercontact({"data": [contact], "enrich_email_address": False, "enrich_phone_number": True})
             row = (rows_of(resp.get("raw"), "data") or [{}])[0] if not resp.get("error") else {}
+            r["mobile_checked"] = not resp.get("error")  # a failed lookup is inconclusive: its row is upserted without the mobile columns
             if row.get("do_not_contact") is not None:
                 r["do_not_contact"] = row["do_not_contact"]  # the opt-out flag stands on its own, number or not
             if row.get("contact_phone_number"):
@@ -637,8 +652,8 @@ def main():
             sys.exit(f"{args.input}: no 'domain' column (found: {', '.join(reader.fieldnames or [])})")
         domains = [norm_domain(r.get("domain")) for r in reader]
     domains = list(dict.fromkeys(d for d in domains if d))[: args.limit]
-    if not domains or not titles or args.max_people < 1:  # fail before any network call or output file is touched
-        sys.exit("nothing to do: need at least one domain, one title and --max-people >= 1")
+    if not domains or not titles or args.max_people < 1 or (args.limit or 1) < 1 or (args.max_age or 0) < 0:  # fail before any network call or output file is touched
+        sys.exit("nothing to do: need at least one domain, one title, --max-people >= 1, --limit >= 1, --max-age >= 0")
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     load_cache()
 

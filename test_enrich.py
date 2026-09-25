@@ -204,11 +204,15 @@ e.apify_jobs = lambda url, max_items=25: {"items": [{"title": f"J{i}", "company"
 a9, ps9 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 2)
 assert a9["title_matches"] == 2 and [p["id"] for p in ps9] == ["li/ann", "acme.com|Bob|Ray"] and a9["jobs_total"] == 25
 # F14: an undisclosed round makes the total unknown (with a reason), not smaller; the last round still fills
-AVIATO["data"]["fundingRounds"].append({"announcedOn": "2024-01-01T00:00:00.000Z", "stage": "Series B"})
+AVIATO["data"]["fundingRounds"].append({"stage": "Series B"})  # undated and undisclosed: excluded from "latest" but still makes the total unknown
 e.deepline = lambda tool, payload, backend="deepline", check=None: {"raw": NOFUND} if tool == "crustdata_v3_company_search" else fake_deepline(tool, payload)
 a10, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
-assert a10["funding_total_usd"] is None and a10["funding_miss_reason"] == "undisclosed_amounts" and a10["last_round_type"] == "Series B"
+assert a10["funding_total_usd"] is None and a10["funding_miss_reason"] == "undisclosed_amounts" and a10["last_round_type"] == "Series A"
 AVIATO["data"]["fundingRounds"].pop()
+AVIATO["data"]["fundingRounds"] += [{"announcedOn": "2010-01-01T00:00:00.000Z", "moneyRaised": 1}] * 18  # a full page of 20 known amounts: total stands, flagged as possibly partial
+a10b, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
+assert a10b["funding_total_usd"] == 14606084 and a10b["funding_miss_reason"] == "possibly_partial:20_rounds"
+del AVIATO["data"]["fundingRounds"][2:]
 # F09 + F08: a non-valid email is kept with a status reason and its real domain; an opt-out flag survives a phone miss
 EMAIL["data"].update(email="ann@other.test", status="invalid")
 e.deepline = fake_deepline
@@ -221,6 +225,25 @@ EMAIL["data"].update(email="ann@acme.com", status="valid")
 writes.clear()
 e.db_write([a9, a9 | {"domain": "acme-old.com"}], ps9 + [ps9[0] | {"domain": "acme-old.com"}], "r2", mobile=False)
 prow = writes[1][1]; assert len(prow) == 2 and not (set(prow[0]) & set(e.MOBILE_COLS)) and prow[0]["domain"] == "acme-old.com"
+# a failed mobile lookup is inconclusive: that row is upserted without the mobile columns even on a --mobile run, so a stored number / opt-out flag survives
+writes.clear()
+e.db_write([a9], [ps11[0] | {"mobile_checked": False}, ps11[0] | {"id": "li/x", "mobile": "+1"}], "r3", mobile=True)
+assert [set(w[1][0]) & set(e.MOBILE_COLS) != set() for w in writes if w[0] == "people"] == [True, False] and writes[1][1][0]["id"] == "li/x" and writes[2][1][0]["id"] == "li/ann"
+# residual: a response where every posting belongs to another company says nothing about this one; the id is the canonical profile key
+e.apify_jobs = lambda url, max_items=25: {"items": [{"title": "X", "company": {"linkedinUrl": "https://www.linkedin.com/company/other"}, "_meta": {"pagination": {"totalElements": 70}}}]}
+LEADS["leads"][:] = [{"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", "linkedinUrl": "LI/Ann/"}]
+a12, ps12 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
+assert "jobs_total" not in a12 and a12["jobs_miss_reason"] == "company_mismatch" and ps12[0]["id"] == "li/ann"
+# residual: a 200 with no result is the gateway's error envelope, never cached as an empty answer; launches never retry a 5xx, only 429
+e.deepline, hits[:] = real_deepline, []
+e.request = lambda *a, **k: (hits.append(1), R(200, {"error": "upstream quota exceeded"}))[1]
+assert real_deepline("company_titles", {"domain": "q.test"})["error"].startswith("no_result:upstream") and real_deepline("company_titles", {"domain": "q.test"})["error"] and len(hits) == 2
+e.request, e.deepline = real_req, fake_deepline
+codes = iter([500, 200]); e.httpx.request = lambda *a, **k: R(next(codes), {}, "err")
+assert e.request("bc", "POST", "u", launch=True).status_code == 500 and next(codes) == 200
+codes = iter([429, 200]); e.time.sleep = lambda s: None
+assert e.request("bc", "POST", "u", launch=True).status_code == 200
+e.time.sleep = real_sleep
 # F13 + F06: a wrong header exits before any network call and leaves prior outputs alone; --out-dir is created; a domain that raises still yields a row and the others export
 import sys
 out = Path(tempfile.mkdtemp()); Path(out, "accounts.csv").write_text("keep")

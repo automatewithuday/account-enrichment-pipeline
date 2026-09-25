@@ -35,7 +35,7 @@ domains.csv + "VP Sales,Chief Revenue,Founder,CEO"
 | Mail routing | mx_provider, mx_security_gateway (true when a gateway sits in front), mx_gateway_type |
 | Mobile (`--mobile` only) | mobile, mobile_cc, mobile_status, do_not_contact (provider opt-out flag, honour it) |
 
-Rows are never dropped. Every step that comes back empty leaves a `*_miss_reason` saying why (`no_jobs`, `no_email`, `domain_mismatch:bit.ly`, `status_invalid`, `http_403`, ...). An email whose verification status is not `valid` or `catch_all` is kept for the record but carries `email_miss_reason=status_<x>`, so filter on that before outreach. Company records the provider returns for a different domain are quarantined: only the miss reason is kept.
+Rows are never dropped. Every step that comes back empty leaves a `*_miss_reason` saying why (`no_jobs`, `no_email`, `domain_mismatch:bit.ly`, `status_invalid`, `http_403`, ...). An email whose verification status is not `valid` or `catch_all` is kept for the record but carries `email_miss_reason=status_<x>`, so filter on that before outreach. Company records the provider returns for a different domain are quarantined: only the miss reason is kept. `funding_miss_reason=possibly_partial:20_rounds` means the total is real but the provider page was full, so later rounds may be missing.
 
 ## Example output
 
