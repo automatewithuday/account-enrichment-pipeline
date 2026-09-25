@@ -600,7 +600,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         if em.get("email"):
             r.update(email=em["email"], email_status=em.get("status"), email_domain=em["email"].rsplit("@", 1)[-1].lower(), mx_provider=em.get("mx_provider"),
                      mx_security_gateway=em.get("mx_security_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
-            if em.get("status") not in ("valid", "catch_all"):  # the address is kept for the record; the reason says it is not outreach-ready
+            if em.get("status") not in ("valid", "valid_catch_all"):  # provider enum: valid | valid_catch_all | not_found; anything else is kept but flagged as not outreach-ready
                 r["email_miss_reason"] = f"status_{em.get('status') or 'unknown'}"
         else:
             r["email_miss_reason"] = resp.get("error") or "no_email"

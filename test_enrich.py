@@ -224,7 +224,10 @@ e.bettercontact = lambda payload: {"raw": {"id": "r3", "status": "terminated", "
 _, ps11 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 1, mobile=True)
 assert ps11[0]["email"] == "ann@other.test" and ps11[0]["email_miss_reason"] == "status_invalid" and ps11[0]["email_domain"] == "other.test"
 assert ps11[0]["do_not_contact"] is True and ps11[0]["mobile_miss_reason"] == "no_mobile" and "mobile" not in ps11[0]
-EMAIL["data"].update(email="ann@acme.com", status="valid")
+EMAIL["data"].update(email="ann@acme.com", status="valid_catch_all")  # the provider's catch-all spelling is a hit, not a flag
+_, ps11b = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 1)
+assert ps11b[0]["email_status"] == "valid_catch_all" and "email_miss_reason" not in ps11b[0]
+EMAIL["data"].update(status="valid")
 # F02 + F15: without --mobile the mobile columns are not sent at all (never nulled); the same person under two domains is one upsert row
 writes.clear()
 e.db_write([a9, a9 | {"domain": "acme-old.com"}], ps9 + [ps9[0] | {"domain": "acme-old.com"}], "r2", mobile=False)
