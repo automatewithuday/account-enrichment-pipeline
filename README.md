@@ -35,7 +35,7 @@ domains.csv + "VP Sales,Chief Revenue,Founder,CEO"
 | Mail routing | mx_provider, mx_security_gateway (true when a gateway sits in front), mx_gateway_type |
 | Mobile (`--mobile` only) | mobile, mobile_cc, mobile_status, do_not_contact (provider opt-out flag, honour it) |
 
-Rows are never dropped. Every blank data column has a sibling `*_miss_reason` that says why it is blank (`no_jobs`, `no_email`, `domain_mismatch:bit.ly`, `http_403`, ...).
+Rows are never dropped. Every step that comes back empty leaves a `*_miss_reason` saying why (`no_jobs`, `no_email`, `domain_mismatch:bit.ly`, `status_invalid`, `http_403`, ...). An email whose verification status is not `valid` or `catch_all` is kept for the record but carries `email_miss_reason=status_<x>`, so filter on that before outreach. Company records the provider returns for a different domain are quarantined: only the miss reason is kept.
 
 ## Example output
 
@@ -101,9 +101,9 @@ Measured on real accounts. Reruns from cache are free.
 | Card only, no contacts | about $0.06 |
 | Card without tech stack | about $0.03 |
 | Each additional verified email | $0.034, nothing on a miss |
-| Each mobile number (`--mobile`) | $0.755 |
+| Each mobile number (`--mobile`) | 10 phone-finder credits, $0.40 to $0.49 depending on plan; nothing on a miss |
 
-Every provider response is cached in `.cache/calls.jsonl`, keyed by the exact request. Re-running a list costs nothing. `--max-age DAYS` re-fetches only responses older than DAYS, which is the knob for a periodic refresh. `--dry-run` prints every call that would be billed before you spend anything.
+Every provider response is cached in `.cache/calls.jsonl`, keyed by the exact request. Re-running a list costs nothing. `--max-age DAYS` re-fetches only responses older than DAYS, which is the knob for a periodic refresh. `--dry-run` prints every call that would be billed before you spend anything; steps that depend on an earlier result (profile, jobs, email, mobile) are covered by the estimate line rather than listed. The per-provider cost columns on each row are what the row's data cost to acquire, cache hits included; the run summary line is what this run actually spent.
 
 ## Quick start
 

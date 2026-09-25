@@ -1,6 +1,6 @@
 """Lean account enrichment: CSV of domains + target titles -> accounts.csv + people.csv.
 
-Nine enrichment steps per domain (firmographics, funding, company profile, tech stack, job postings, titles, people, verified email),
+Ten steps per domain, eleven with --mobile (mail routing, firmographics, funding, company profile, tech stack, job postings, titles, people, verified email, mobile),
 each behind a credentialed provider configured in .env. Every network call is cached in .cache/calls.jsonl keyed by
 (backend, id, payload); reruns cost nothing. With database keys in .env every run also upserts companies / people / raw_responses (see schema.sql).
 """
@@ -36,7 +36,9 @@ SPENT: list[tuple[str, float, bool, float]] = []  # (backend, amount, from_cache
 RAW: list[dict] = []  # every non-error response this run, in raw_responses row shape; cache hits included so a rerun backfills the DB
 CUR_DOMAIN = None  # ponytail: single-threaded global so cached() can stamp RAW rows with the domain being enriched
 MAX_AGE_DAYS = None  # --max-age: cached responses older than this are re-fetched (and re-billed)
-JOBS_MAX = 25  # LinkedIn postings per company, $0.001 each; count shows "25+" when capped
+JOBS_MAX = 25  # LinkedIn postings per company, $0.001 each; jobs_total is the actor's own total, else the fetched count (integer, schema column)
+RUN_ID = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())  # per-process; also salts the gateway Idempotency-Key so a --max-age refetch is not replayed
+BATCH_TS: list[float] = []  # fetch epochs of the batched baseline/identify calls; count toward a row's freshness when it used them
 STALE_TECH_DAYS = 180  # ponytail: a technology last detected before this goes to tech_stale; tune once scoring says what "current" means
 DRY = False
 PLANNED: list[str] = []
@@ -101,10 +103,16 @@ def rows_of(raw, *keys):
 
 def load_cache():
     if CACHE_PATH.exists():
+        bad = 0
         for line in CACHE_PATH.read_text().splitlines():
             if line.strip():
-                rec = json.loads(line)
-                CACHE[rec["key"]] = rec
+                try:
+                    rec = json.loads(line)
+                    CACHE[rec["key"]] = rec
+                except (ValueError, KeyError):  # ponytail: a crash mid-append leaves a truncated tail; skip it, the call just re-runs
+                    bad += 1
+        if bad:
+            print(f"cache: skipped {bad} unreadable line(s) in {CACHE_PATH}", file=sys.stderr)
 
 
 def cached(backend, ident, payload, fn):
@@ -120,7 +128,7 @@ def cached(backend, ident, payload, fn):
         return {"error": "dry_run"}
     resp = fn(key)
     cost = float(resp.pop("_cost", 0.0))
-    SPENT.append((backend, cost, False, time.time()))
+    SPENT.append((backend, cost, False, 0 if "error" in resp else time.time()))  # a failed attempt never moves data_as_of / last_enriched_at
     if "error" not in resp:  # errors are never cached, so a fixed key/quota just reruns
         rec = {"key": key, "backend": backend, "id": ident, "resp": resp, "cost": cost, "ts": time.time()}
         CACHE_PATH.parent.mkdir(exist_ok=True)
@@ -155,17 +163,25 @@ def db_upsert(table, rows, on_conflict):
 DB_HIDE = {"company_source", "linkedin_url_source", "funding_source", "crustdata_updated_at", "deepline_cr", "apify_usd", "builtwith_cr", "bettercontact_cr", "source", "mobile_source"}  # provider names stay in the CSVs and raw_responses, never on the demo tables
 
 
-def db_write(accounts, people, run_id):
-    """companies first (people/raw carry its FK), then people, then raw responses deduped by cache key. Blank strings become NULL."""
+MOBILE_COLS = ["mobile", "mobile_cc", "mobile_status", "mobile_source", "do_not_contact", "mobile_miss_reason"]
+
+
+def db_write(accounts, people, run_id, mobile=True):
+    """companies first (people/raw carry its FK), then people, then raw responses deduped by cache key. Blank strings become NULL.
+    Without --mobile the mobile columns are left out of the upsert entirely, so a plain rerun never nulls numbers or opt-out flags bought earlier.
+    People are deduped by id (one person under two input domains would otherwise hit the same key twice in one statement)."""
     clean = lambda row: {k: (None if v == "" else v) for k, v in row.items() if k not in DB_HIDE}
+    pcols = [c for c in PEOPLE_COLS if mobile or c not in MOBILE_COLS] + ["id", "last_enriched_at"]
+    people = list({p["id"]: p for p in people}.values())
     nc = db_upsert("companies", [clean({k: a.get(k) for k in ACCOUNT_COLS + ["last_enriched_at"]} | {"run_id": run_id}) for a in accounts], "domain")
-    np_ = db_upsert("people", [clean({k: p.get(k) for k in PEOPLE_COLS + ["id", "last_enriched_at"]} | {"run_id": run_id}) for p in people], "id")
+    np_ = db_upsert("people", [clean({k: p.get(k) for k in pcols} | {"run_id": run_id}) for p in people], "id")
     nr = db_upsert("raw_responses", [r | {"run_id": run_id} for r in {r["cache_key"]: r for r in RAW}.values()], "cache_key")
     return f"companies {nc}, people {np_}, raw {nr}"
 
 
-def request(label, method, url, **kw):
-    """4 attempts on 429/409/5xx/transport errors; returns Response or None when exhausted."""
+def request(label, method, url, retry_transport=True, **kw):
+    """4 attempts on 429/409/5xx/transport errors; returns Response or None when exhausted.
+    retry_transport=False for launches without an idempotency key: a read timeout after the server accepted would otherwise start (and bill) a second job."""
     for i in range(4):
         try:
             r = httpx.request(method, url, **kw)
@@ -174,24 +190,41 @@ def request(label, method, url, **kw):
             err = f"http_{r.status_code}"
         except httpx.TransportError as e:
             err = f"transport:{type(e).__name__}"
+            if not retry_transport:
+                log("no retry", label, err)
+                return None
         log("retry", label, err)
         time.sleep(2 ** i)
     return None
 
 
-def deepline(tool, payload, backend="deepline"):
+def body_json(r):
+    """Response body as JSON, or None when the provider sent something else (callers return an error, which is never cached)."""
+    try:
+        return r.json()
+    except ValueError:
+        log("bad_json", r.status_code, r.text[:200])
+        return None
+
+
+def deepline(tool, payload, backend="deepline", check=None):
+    """check(raw) -> error string or None: provider-level errors inside a 200 body (quota, bad input) must surface before the cache sees them."""
     def fn(key):
         if not DL_KEY:
             return {"error": "no_deepline_key"}
         r = request(tool, "POST", f"{HOST}/api/v2/integrations/{tool}/execute", json={"payload": payload},
-                    headers={"Authorization": f"Bearer {DL_KEY}", "Idempotency-Key": key}, timeout=90)
+                    headers={"Authorization": f"Bearer {DL_KEY}", "Idempotency-Key": f"{key}:{RUN_ID}"}, timeout=90)
         if r is None:
             return {"error": "http_5xx_exhausted"}
         if r.status_code >= 400:
             log(tool, r.status_code, r.text[:600])
             return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
-        body = r.json()
+        body = body_json(r)
+        if not isinstance(body, dict):
+            return {"error": "bad_json"}
         raw = get(body, "toolResponse.raw", "result")
+        if check and (err := check(raw)):
+            return {"error": err}
         billing = body.get("billing")
         log(tool, r.status_code, billing, json.dumps(raw)[:700])
         cost = get(billing or {}, "credits", "creditsCharged", "credits_charged", "amount")
@@ -205,17 +238,19 @@ def apify(actor, payload, per_item_usd, start_usd=0.001, **params):
     def fn(key):
         if not APIFY_TOKEN:
             return {"error": "no_apify_token"}
-        r = request("apify", "POST", f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items",
+        r = request("apify", "POST", f"https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items", retry_transport=False,  # a re-launch re-bills
                     params={"token": APIFY_TOKEN, "clean": "true", **params}, json=payload, timeout=320)  # the platform hard-fails sync runs at 300s
         if r is None:
             return {"error": "http_5xx_exhausted"}
         if r.status_code == 408:
             return {"error": "apify_408_timeout"}
         if r.status_code == 403 and "not-approved" in r.text:  # one-time approval in the platform console
-            return {"error": "apify_actor_not_approved:" + str(get(r.json(), "error.data.approvalUrl"))}
+            return {"error": "apify_actor_not_approved:" + str(get(body_json(r) or {}, "error.data.approvalUrl"))}
         if r.status_code >= 400:
             return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
-        items = r.json()
+        items = body_json(r)
+        if not isinstance(items, list):
+            return {"error": "bad_json"}
         log("apify", actor, r.status_code, len(items))
         return {"items": items, "_cost": start_usd + per_item_usd * len(items)}
     return cached("apify", actor, payload, fn)
@@ -227,21 +262,25 @@ def bettercontact(payload):
         if not BC_KEY:
             return {"error": "no_bettercontact_key"}
         h = {"X-API-Key": BC_KEY}
-        r = request("bettercontact", "POST", BC_URL, json=payload, headers=h, timeout=60)
-        for i in range(25):  # 202 with no data while running; 200 + status=terminated when done
+        r = request("bettercontact", "POST", BC_URL, json=payload, headers=h, timeout=60, retry_transport=False)  # no idempotency key: never re-launch blind
+        raw = {}
+        for i in range(26):  # launch + 25 polls at 5 s; 202 with no data while running, 200 + status=terminated when done; every response is inspected
+            if i:
+                time.sleep(5)
+                r = request("bettercontact", "GET", f"{BC_URL}/{raw.get('id')}", headers=h, timeout=60)
             if r is None:
                 return {"error": "http_5xx_exhausted"}
             if r.status_code >= 400:
                 log("bettercontact", r.status_code, r.text[:600])
                 return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
-            raw = r.json()
+            raw = body_json(r)
+            if not isinstance(raw, dict):
+                return {"error": "bad_json"}
             if raw.get("status") == "terminated":
                 rows = raw.get("data") or []
                 log("bettercontact", r.status_code, json.dumps(raw)[:700])
                 return {"raw": raw, "_cost": 10 * sum(1 for x in rows if x.get("contact_phone_number"))}
-            time.sleep(5)
-            r = request("bettercontact", "GET", f"{BC_URL}/{raw.get('id')}", headers=h, timeout=60)
-        return {"error": "async_timeout"}
+        return {"error": "async_timeout"}  # ponytail: the job id is lost here; persist it and resume if timeouts ever show up in practice
     return cached("bettercontact", "async", payload, fn)
 
 
@@ -257,15 +296,16 @@ def apify_company(linkedin_url):
 
 def builtwith(domain):
     """Tech names: 0.14 cr per domain, so one call per domain keeps the cache per domain."""
+    def check(raw):  # provider errors (quota, bad key) arrive inside a 200 body; surfacing them here keeps them out of the cache
+        errs = get(raw or {}, "Errors", "data.Errors")
+        if errs:
+            e = errs[0] if isinstance(errs[0], dict) else {"Message": str(errs[0])}
+            return f"builtwith_{e.get('Code')}_{str(e.get('Message', ''))[:40]}"
     resp = deepline("builtwith_domain_lookup", {"domains": [domain], "live_only": True, "hide_text": True,
-                                                "no_meta": True, "no_attr": True, "no_pii": True}, backend="builtwith")
+                                                "no_meta": True, "no_attr": True, "no_pii": True}, backend="builtwith", check=check)
     if resp.get("error"):
         return resp
     raw = resp.get("raw") or {}
-    errs = get(raw, "Errors", "data.Errors")
-    if errs:
-        e = errs[0] if isinstance(errs[0], dict) else {"Message": str(errs[0])}
-        return {"error": f"builtwith_{e.get('Code')}_{str(e.get('Message', ''))[:40]}"}
     tech = {}
     for res in get(raw, "Results", "data.Results") or []:
         names = {}  # name -> LastDetected epoch ms (None when the provider gives none)
@@ -301,10 +341,10 @@ def suffix_match(host, table, key):
 def classify_mx(hosts, spf):
     """Gateway = first MX host (preference order) matching a gateway suffix; mailbox from MX when direct, else from SPF include."""
     seg = next((v for h in hosts if (v := suffix_match(h, GATEWAY_MAP["gateways"], "suffixes"))), None)
-    prov = None if seg else next((p for h in hosts if (p := suffix_match(h, GATEWAY_MAP["mailbox_providers"], "mx_suffixes"))), None)
-    if not prov:
-        prov = next((p for p, e in GATEWAY_MAP["mailbox_providers"].items() if any(f"include:{i}" in spf for i in e["spf_includes"])), None)
-    return {"seg_vendor": seg or ("none" if prov else "unknown"), "mailbox_provider": prov or "other", "mx_hosts": "|".join(hosts)}
+    mx_prov = None if seg else next((p for h in hosts if (p := suffix_match(h, GATEWAY_MAP["mailbox_providers"], "mx_suffixes"))), None)
+    prov = mx_prov or next((p for p, e in GATEWAY_MAP["mailbox_providers"].items() if any(f"include:{i}" in spf for i in e["spf_includes"])), None)
+    # "none" only when the MX itself is a known mailbox host; an unmapped MX with an SPF hint is still an unidentified hop
+    return {"seg_vendor": seg or ("none" if mx_prov else "unknown"), "mailbox_provider": prov or "other", "mx_hosts": "|".join(hosts)}
 
 
 def mail_gateway(d):
@@ -337,6 +377,8 @@ def linkedin_from_site(d):
             r = httpx.get(f"https://{d}", follow_redirects=True, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         except httpx.HTTPError as e:
             return {"error": f"site_{type(e).__name__}"}
+        if r.status_code >= 400 and r.status_code not in (404, 410):  # bot walls / outages are retried next run; a missing page is a real miss
+            return {"error": f"site_http_{r.status_code}"}
         slugs = [m.group(1).rstrip("/").lower() for m in LI_COMPANY.finditer(r.text)] if r.status_code < 400 else []
         return {"slug": slugs[0] if slugs else None, "status": r.status_code}
     return cached("web", "homepage_linkedin", {"domain": d}, fn)
@@ -389,14 +431,13 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
     resp = deepline("crustdata_v3_company_search", {"filters": {"field": "basic_info.primary_domain", "type": "=", "value": d}, "limit": 1})
     rows = rows_of(resp.get("raw"), "companies")
     c = {}
-    if resp.get("error") or not rows:
-        a["company_miss_reason"] = a["funding_miss_reason"] = resp.get("error") or "no_crustdata_match"
+    pd = norm_domain(get(rows[0], "basic_info.primary_domain")) if rows else None
+    if resp.get("error") or not rows or pd != d:  # a row for another domain is quarantined: nothing of it (funding, aliases) reaches this account
+        a["company_miss_reason"] = a["funding_miss_reason"] = resp.get("error") or (f"domain_mismatch:{pd}" if rows else "no_crustdata_match")
+        rows = []
     else:
         c = rows[0]
-        pd = norm_domain(get(c, "basic_info.primary_domain"))
-        if pd != d:
-            a["company_miss_reason"] = f"domain_mismatch:{pd}"
-        elif b.get("_shared", 0) > 5:
+        if b.get("_shared", 0) > 5:
             a["company_miss_reason"] = f"shared_domain:{b['_shared']}_companies"  # data is for *some* company on this host
         pct = lambda g: round(g, 1) if isinstance(g, (int, float)) else None
         a.update({k: v for k, v in {
@@ -424,13 +465,16 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
     if a.get("funding_total_usd") is not None:
         a["funding_source"] = "crustdata"
     else:
-        resp = deepline("aviato_get_company_funding_rounds", {"website": d, "perPage": 20, "page": 0})
+        resp = deepline("aviato_get_company_funding_rounds", {"website": d, "perPage": 20, "page": 0})  # ponytail: first 20 rounds only; paginate if a company ever has more
         rounds = [r for r in rows_of(resp.get("raw"), "fundingRounds") if r.get("announcedOn")]
         if rounds:
             last = max(rounds, key=lambda r: r["announcedOn"])
-            a.update({"funding_source": "aviato", "funding_total_usd": sum(r.get("moneyRaised") or 0 for r in rounds), "last_round_type": last.get("stage"),
+            known = all(isinstance(r.get("moneyRaised"), (int, float)) for r in rounds)  # an undisclosed round makes the total unknown, not smaller
+            a.update({"funding_source": "aviato", "funding_total_usd": sum(r["moneyRaised"] for r in rounds) if known else None, "last_round_type": last.get("stage"),
                       "last_round_amount_usd": last.get("moneyRaised"), "last_round_date": last["announcedOn"][:10]})
             a.pop("funding_miss_reason", None)
+            if not known:
+                a["funding_miss_reason"] = "undisclosed_amounts"
         else:
             a["funding_miss_reason"] = a.get("funding_miss_reason") or resp.get("error") or "not_available"
 
@@ -487,9 +531,9 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         else:
             want = a["linkedin_url"].lower().rstrip("/")  # the company's LinkedIn URL is a stronger identity than its website (bit.ly links, legacy domains)
             items = [j for j in resp["items"] if (get(j, "company.linkedinUrl") or "").lower().rstrip("/") in ("", want)]  # drop wrong-company hits
-            aliases.update(norm_domain(get(j, "company.website")) for j in items)
+            aliases.update(norm_domain(get(j, "company.website")) for j in items if get(j, "company.linkedinUrl"))  # only a verified company's site may seed the people search
             total = get(resp["items"][0], "_meta.pagination.totalElements") if resp["items"] else None  # true 30-day count, all postings
-            a["jobs_total"] = total if isinstance(total, int) else (f"{len(items)}+" if resp.get("capped", len(resp["items"]) >= JOBS_MAX) else len(items))
+            a["jobs_total"] = total if isinstance(total, int) else len(items)  # integer always (schema column); a capped fetch without the total is a lower bound
             a["jobs_newest_posted"] = max(((j.get("postedDate") or "")[:10] for j in items), default=None) or None
             a["job_titles"] = ";".join(dict.fromkeys(j.get("title") for j in items if j.get("title"))) or None  # newest first, up to JOBS_MAX
             if not items:
@@ -504,20 +548,20 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
 
     # ponytail: link shorteners would pull people from the shortener's own company; extend the tuple when a new one shows up
     aliases = sorted(x for x in aliases | {norm_domain(a.get("website"))} if x and x != d and x not in ("bit.ly", "lnkd.in", "linktr.ee", "t.co"))
-    people, scanned, pstart = [], 0, len(SPENT)
+    person_key = lambda p: (p.get("linkedinUrl") or "").lower().rstrip("/") or f"{p.get('firstName')}|{p.get('lastName')}".lower()  # URL variants collapse, no-URL people stay distinct
+    uniq, scanned, pstart = {}, 0, len(SPENT)
     for dom in [d] + aliases:  # alias domains (rebrands, legacy sites) only when nobody is indexed under the input domain; the people search is free
         for page in (1, 2):
             resp = deepline("dropleads_search_people", {"filters": {"companyDomains": [dom], "jobTitles": titles}, "pagination": {"page": page, "limit": 50}})
             leads = rows_of(resp.get("raw"), "leads")
             scanned += len(leads)
-            people += [p for p in leads if match_titles(p.get("title"), titles)]
-            if resp.get("error") or len(leads) < 50 or len(people) >= max_people:
+            for p in leads:  # the people index holds duplicate records per person; keep the first, count unique people against the limit
+                if match_titles(p.get("title"), titles):
+                    uniq.setdefault(person_key(p), p)
+            if resp.get("error") or len(leads) < 50 or len(uniq) >= max_people:
                 break
         if scanned or resp.get("error"):
             break
-    uniq = {}
-    for p in people:
-        uniq.setdefault(p.get("linkedinUrl") or p.get("fullName"), p)  # the people index holds duplicate records per person; keep the first
     people = list(uniq.values())[:max_people]
     a["title_matches"] = len(people)
     if resp.get("error") and scanned == 0:
@@ -535,17 +579,21 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         resp = deepline("leadmagic_email_finder", {"first_name": r["first_name"], "last_name": r["last_name"], "domain": dom})
         em = get(resp, "raw.data") or {}
         if em.get("email"):
-            r.update(email=em["email"], email_status=em.get("status"), email_domain=dom, mx_provider=em.get("mx_provider"),
+            r.update(email=em["email"], email_status=em.get("status"), email_domain=em["email"].rsplit("@", 1)[-1].lower(), mx_provider=em.get("mx_provider"),
                      mx_security_gateway=em.get("mx_security_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
+            if em.get("status") not in ("valid", "catch_all"):  # the address is kept for the record; the reason says it is not outreach-ready
+                r["email_miss_reason"] = f"status_{em.get('status') or 'unknown'}"
         else:
             r["email_miss_reason"] = resp.get("error") or "no_email"
         if mobile:  # --mobile: direct waterfall phone finder, phone only (no email credit), billed on a hit
             contact = {"first_name": r["first_name"], "last_name": r["last_name"], "company_domain": dom} | ({"linkedin_url": r["linkedin_url"]} if r.get("linkedin_url") else {})
             resp = bettercontact({"data": [contact], "enrich_email_address": False, "enrich_phone_number": True})
             row = (rows_of(resp.get("raw"), "data") or [{}])[0] if not resp.get("error") else {}
+            if row.get("do_not_contact") is not None:
+                r["do_not_contact"] = row["do_not_contact"]  # the opt-out flag stands on its own, number or not
             if row.get("contact_phone_number"):
                 r.update(mobile=row["contact_phone_number"], mobile_cc=row.get("contact_phone_number_cc"), mobile_status=row.get("contact_phone_number_status"),
-                         mobile_source=row.get("contact_phone_number_provider"), do_not_contact=row.get("do_not_contact"))
+                         mobile_source=row.get("contact_phone_number_provider"))
             else:
                 r["mobile_miss_reason"] = resp.get("error") or "no_mobile"
         own_ts = [ts for _, _, _, ts in SPENT[n:] if ts]
@@ -553,7 +601,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
 
     for backend, col in (("deepline", "deepline_cr"), ("apify", "apify_usd"), ("builtwith", "builtwith_cr"), ("bettercontact", "bettercontact_cr")):
         a[col] = round(sum(x for bk, x, _, _ in SPENT[start:] if bk == backend), 4)
-    fetched = [ts for _, _, _, ts in SPENT[start:] if ts]
+    fetched = [ts for _, _, _, ts in SPENT[start:] if ts] + (BATCH_TS if b or d in ident else [])  # the batched free-table/identify fetches count when the row drew on them
     a["data_as_of"] = time.strftime("%Y-%m-%d", time.gmtime(min(fetched))) if fetched else None  # oldest response behind this row
     a["last_enriched_at"] = iso(max(fetched)) if fetched else None  # newest live fetch behind this row; cache-served reruns leave it unchanged
     CUR_DOMAIN = None
@@ -584,16 +632,27 @@ def main():
     DRY, MAX_AGE_DAYS = args.dry_run, args.max_age
     titles = [t.strip() for t in args.titles.split(",") if t.strip()]
     with open(args.input, newline="") as f:
-        domains = [norm_domain(r.get("domain")) for r in csv.DictReader(f)]
+        reader = csv.DictReader(f)
+        if "domain" not in (reader.fieldnames or []):
+            sys.exit(f"{args.input}: no 'domain' column (found: {', '.join(reader.fieldnames or [])})")
+        domains = [norm_domain(r.get("domain")) for r in reader]
     domains = list(dict.fromkeys(d for d in domains if d))[: args.limit]
+    if not domains or not titles or args.max_people < 1:  # fail before any network call or output file is touched
+        sys.exit("nothing to do: need at least one domain, one title and --max-people >= 1")
+    Path(args.out_dir).mkdir(parents=True, exist_ok=True)
     load_cache()
 
     base = baseline(domains)
     ident = identify(domains)
+    BATCH_TS[:] = [ts for _, _, _, ts in SPENT if ts]
 
     accounts, people = [], []
     for d in domains:
-        a, ps = enrich_domain(d, titles, base, ident, args.max_people, args.mobile)
+        try:
+            a, ps = enrich_domain(d, titles, base, ident, args.max_people, args.mobile)
+        except Exception as e:  # one bad provider payload must not lose the domains already enriched
+            print(f"{d}: failed with {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+            a, ps = {"domain": d, "company_miss_reason": f"exception:{type(e).__name__}", "title_matches": 0}, []
         accounts.append(a)
         people += ps
         print(f"{d}: {a.get('company_name') or '-'} | openings={a.get('openings_count')} | jobs={a.get('jobs_total')} | people={a['title_matches']}", file=sys.stderr)
@@ -609,7 +668,7 @@ def main():
     ap_usd = sum(x for bk, x, c, _ in SPENT if bk == "apify" and not c)
     bw = sum(x for bk, x, c, _ in SPENT if bk == "builtwith" and not c)
     bc = sum(x for bk, x, c, _ in SPENT if bk == "bettercontact" and not c)
-    db = "off" if args.no_db or not (SB_URL and SB_KEY) else db_write(accounts, people, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
+    db = "off" if args.no_db or not (SB_URL and SB_KEY) else db_write(accounts, people, RUN_ID, args.mobile)
     print(f"Wrote accounts.csv ({len(accounts)}) and people.csv ({len(people)}). "
           f"Run cost: Deepline {dl:.2f} cr | Apify ${ap_usd:.3f} | BuiltWith {bw:.2f} cr | Mobile {bc:.0f} cr | {sum(1 for _, _, c, _ in SPENT if c)} cached calls | db: {db}", file=sys.stderr)
 

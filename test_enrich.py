@@ -53,7 +53,7 @@ BW = {"data": {"Results": [{"Lookup": "acme.com", "Result": {"Paths": [{"Technol
 AVIATO = {"data": {"fundingRounds": [{"announcedOn": "2020-02-25T00:00:00.000Z", "moneyRaised": 306066, "stage": "Seed"}, {"announcedOn": "2022-05-04T00:00:00.000Z", "moneyRaised": 14300000, "stage": "Series A"}]}}
 EMAIL = {"data": {"email": "ann@acme.com", "status": "valid", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "processed_at": "2026-09-25T01:02:03Z"}}
 MOBILE = {"id": "req1", "status": "terminated", "data": [{"contact_phone_number": "+15550001234", "contact_phone_number_cc": "US", "contact_phone_number_status": "not_validated", "contact_phone_number_provider": "vendor-x", "do_not_contact": False, "contact_email_address": "other@acme.com"}]}
-def fake_deepline(tool, payload, backend="deepline"):
+def fake_deepline(tool, payload, backend="deepline", check=None):
     return {"raw": {"crustdata_v3_company_search": CRUST, "company_titles": {"titles": ["VP Sales", "Engineer"]},
                     "dropleads_search_people": LEADS, "builtwith_domain_lookup": BW, "aviato_get_company_funding_rounds": AVIATO, "leadmagic_email_finder": EMAIL}[tool]}
 real_deepline, e.deepline = e.deepline, fake_deepline
@@ -61,7 +61,7 @@ real_bc, e.bettercontact = e.bettercontact, lambda payload: {"raw": MOBILE}
 e.apify_company = lambda url: {"items": [{"name": "Acme Inc", "employeeCount": 130, "employeeCountRange": {"start": 51, "end": 200},
     "industries": [{"name": "Software Development"}], "foundedOn": {"year": 2014}, "followerCount": 10, "companyType": "Privately Held",
     "locations": [{"city": "Denver", "geographicArea": "Colorado", "country": "US"}, {"city": "Austin", "geographicArea": "Texas", "country": "US", "headquarter": True}]}]}
-e.linkedin_from_site = lambda d: {"slug": "acme-inc"} if d == "acme.com" else {"slug": None}
+real_site, e.linkedin_from_site = e.linkedin_from_site, lambda d: {"slug": "acme-inc"} if d == "acme.com" else {"slug": None}
 e.mail_gateway = lambda d: {"raw": {"status": "ok", "seg_vendor": "mimecast", "mailbox_provider": "google", "mx_hosts": "us-smtp-inbound-1.mimecast.com"}}
 LI = "https://www.linkedin.com/company/acme-inc"
 e.apify_jobs = lambda url, max_items=10: {"items": [{"title": "AE", "postedDate": "2026-09-01T00:00:00Z", "company": {"linkedinUrl": LI + "/", "website": "https://acme-legacy.io/?utm=x"}, "_meta": {"pagination": {"totalElements": 41}}},
@@ -81,16 +81,21 @@ assert not any(k.endswith("miss_reason") for k in a)
 assert "mobile" not in ps[0] and "mobile_miss_reason" not in ps[0]  # mobile is opt-in
 # direct phone finder: POST launches, GET polls until status=terminated; 10 credits per phone found, cached under the launch payload
 class R:
-    def __init__(s, code, body): s.status_code, s._b = code, body
-    def json(s): return s._b
-polls = iter([("POST", R(201, {"success": True, "id": "j1"})), ("GET", R(202, {"id": "j1", "status": "processing"})),
-              ("GET", R(200, {"id": "j1", "status": "terminated", "data": [{"contact_phone_number": "+1"}, {"contact_phone_number": None}]}))])
+    def __init__(s, code, body, text=""): s.status_code, s._b, s.text = code, body, text
+    def json(s):
+        if s._b is None: raise ValueError("bad json")
+        return s._b
+DONE = R(200, {"id": "j1", "status": "terminated", "data": [{"contact_phone_number": "+1"}, {"contact_phone_number": None}]})
+polls = iter([("POST", R(201, {"success": True, "id": "j1"})), ("GET", R(202, {"id": "j1", "status": "processing"})), ("GET", DONE)])
 real_req, real_sleep, e.BC_KEY = e.request, e.time.sleep, "k"
 def fake_req(label, method, url, **kw):
     m, r = next(polls); assert m == method, (m, method); return r
 e.request, e.time.sleep = fake_req, lambda s: None
 resp = real_bc({"data": [{"first_name": "A", "last_name": "B"}], "enrich_phone_number": True})
 assert resp["raw"]["status"] == "terminated" and resp["raw"]["data"][0]["contact_phone_number"] == "+1" and e.SPENT[-1] [1] == 10, resp
+# a result that lands on the very last poll is still read, not discarded
+polls = iter([("POST", R(201, {"id": "j2"}))] + [("GET", R(202, {"id": "j2", "status": "processing"}))] * 24 + [("GET", DONE)])
+assert real_bc({"data": [{"first_name": "A", "last_name": "C"}], "enrich_phone_number": True})["raw"]["status"] == "terminated"
 e.request, e.time.sleep = real_req, real_sleep
 _, psm = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5, mobile=True)
 assert psm[0]["mobile"] == "+15550001234" and psm[0]["mobile_cc"] == "US" and psm[0]["mobile_status"] == "not_validated" and psm[0]["mobile_source"] == "vendor-x" and psm[0]["do_not_contact"] is False and psm[0]["email"] == "ann@acme.com"
@@ -98,11 +103,11 @@ a2, _ = e.enrich_domain("acme.com", ["vp sales"], {"acme.com": {"_shared": 40}},
 assert a2["company_miss_reason"] == "shared_domain:40_companies" and a2["company_name"] == "Acme Inc"
 a3, _ = e.enrich_domain("other.com", ["vp sales"], {}, {"other.com": ("https://www.linkedin.com/company/other", 0.5)}, 5)
 assert a3["linkedin_url_source"] == "identify:0.5"
-assert a3["company_miss_reason"] == "domain_mismatch:acme.com" and a3["company_name"] == "Acme Inc"
+assert a3["company_miss_reason"] == "domain_mismatch:acme.com" and "revenue_estimate_high_usd" not in a3 and a3["funding_source"] == "aviato"  # quarantined: nothing of the other company's row is kept
 
 # through the real cache layer: RAW rows carry the domain, last_enriched_at is the newest fetch, a person without a LinkedIn URL still gets a stable id
 e.RAW.clear()
-e.deepline = lambda tool, payload, backend="deepline": e.cached(backend, tool, payload, lambda k: fake_deepline(tool, payload) | {"_cost": 0.0})
+e.deepline = lambda tool, payload, backend="deepline", check=None: e.cached(backend, tool, payload, lambda k: fake_deepline(tool, payload) | {"_cost": 0.0})
 import copy
 NOURL = copy.deepcopy(LEADS); del NOURL["leads"][0]["linkedinUrl"]; del NOURL["leads"][1]["linkedinUrl"]
 
@@ -131,11 +136,11 @@ assert [r["cache_key"] for r in writes[2][1]] == ["k1", "k2"] and writes[2][1][0
 # funding fallback: company record has no funding block -> funding rounds by website; a 0 in the company record is a real zero and never falls back
 import copy
 NOFUND = copy.deepcopy(CRUST); del NOFUND["companies"][0]["funding"]
-e.deepline = lambda tool, payload, backend="deepline": {"raw": NOFUND} if tool == "crustdata_v3_company_search" else fake_deepline(tool, payload)
+e.deepline = lambda tool, payload, backend="deepline", check=None: {"raw": NOFUND} if tool == "crustdata_v3_company_search" else fake_deepline(tool, payload)
 a5, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
 assert a5["funding_source"] == "aviato" and a5["funding_total_usd"] == 14606066 and a5["last_round_type"] == "Series A" and a5["last_round_date"] == "2022-05-04" and "funding_miss_reason" not in a5
 ZERO = copy.deepcopy(CRUST); ZERO["companies"][0]["funding"] = {"total_investment_usd": 0}
-e.deepline = lambda tool, payload, backend="deepline": {"raw": ZERO} if tool == "crustdata_v3_company_search" else (_ for _ in ()).throw(AssertionError("aviato must not run on 0")) if tool.startswith("aviato") else fake_deepline(tool, payload)
+e.deepline = lambda tool, payload, backend="deepline", check=None: {"raw": ZERO} if tool == "crustdata_v3_company_search" else (_ for _ in ()).throw(AssertionError("aviato must not run on 0")) if tool.startswith("aviato") else fake_deepline(tool, payload)
 a6, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
 assert a6["funding_total_usd"] == 0 and a6["funding_source"] == "crustdata"
 e.deepline = fake_deepline
@@ -143,7 +148,7 @@ e.deepline = fake_deepline
 # people fallback: nobody indexed under the input domain -> try alias domains (company record all_domains, job-company website), never shorteners
 CRUST["companies"][0]["basic_info"]["all_domains"] = ["acme.com", "bit.ly", "acme-old.com"]
 seen = []
-def fake_dropleads(tool, payload, backend="deepline"):
+def fake_dropleads(tool, payload, backend="deepline", check=None):
     if tool == "leadmagic_email_finder":
         seen.append("email:" + payload["domain"]); return {"raw": {"data": {"email": None, "message": "not found"}}}
     if tool != "dropleads_search_people":
@@ -160,7 +165,7 @@ assert a4["title_matches"] == 1 and ps4[0]["source"] == "dropleads:acme-old.com"
 assert ps4[0]["email_miss_reason"] == "no_email" and "email" not in ps4[0] and ps4[0]["mobile_miss_reason"] == "no_mobile" and "mobile" not in ps4[0]
 
 # misses carry reasons; zero openings skips the paid jobs call
-e.deepline = lambda tool, payload, backend="deepline": {"error": "http_401"} if tool != "crustdata_v3_company_search" else {"raw": {"companies": [{"basic_info": {"name": "Z"}, "hiring": {"openings_count": 0}}]}}
+e.deepline = lambda tool, payload, backend="deepline", check=None: {"error": "http_401"} if tool != "crustdata_v3_company_search" else {"raw": {"companies": [{"basic_info": {"name": "Z", "primary_domain": "z.com"}, "hiring": {"openings_count": 0}}]}}
 e.apify_jobs = lambda *a, **k: (_ for _ in ()).throw(AssertionError("apify must not be called"))
 e.mail_gateway = lambda d: {"error": "dns_lifetimetimeout"}
 a, ps = e.enrich_domain("z.com", ["ceo"], {}, {}, 5)
@@ -174,4 +179,59 @@ d = tempfile.mkdtemp()
 e.write_csvs([a | {"junk": 1}], ps, d)
 head = Path(d, "accounts.csv").read_text().splitlines()
 assert head[0] == ",".join(e.ACCOUNT_COLS) and head[1].startswith("z.com,crustdata,Z,")
+
+# --- review fixes, one check each ---
+# F10: a failed attempt records no fetch time, so it can never move data_as_of / last_enriched_at
+e.cached("deepline", "t", {"x": 3}, lambda k: {"error": "http_500"}); assert e.SPENT[-1][3] == 0
+# F06: a truncated cache tail is skipped, not fatal; a non-JSON body is an error, never cached
+e.CACHE_PATH.write_text('{"key": "k9", "backend": "b", "id": "t", "resp": {}, "cost": 0, "ts": 1}\n{"key": "k10", "trunc')
+e.CACHE.clear(); e.load_cache(); assert set(e.CACHE) == {"k9"}
+assert e.body_json(R(200, None)) is None
+# F16: an unmapped MX with a Google SPF hint stays an unidentified hop, not a confirmed "none"
+assert e.classify_mx(["mx.unknown-gateway.test"], "v=spf1 include:_spf.google.com ~all") == {"seg_vendor": "unknown", "mailbox_provider": "google", "mx_hosts": "mx.unknown-gateway.test"}
+# F05: provider-level errors inside a 200 body (BuiltWith quota) and homepage bot walls are errors, so they are retried next run instead of cached
+e.deepline, e.DL_KEY, hits = real_deepline, "k", []
+e.request = lambda *a, **k: (hits.append(1), R(200, {"result": {"Errors": [{"Code": 7, "Message": "quota exceeded"}]}}))[1]
+assert e.builtwith("q.test")["error"] == "builtwith_7_quota exceeded" and e.builtwith("q.test")["error"] and len(hits) == 2
+e.request, e.deepline = real_req, fake_deepline
+real_get, e.httpx.get = e.httpx.get, lambda *a, **k: (hits.append(2), R(503, {}, "down"))[1]
+assert real_site("q.test")["error"] == "site_http_503" and real_site("q.test")["error"] and hits.count(2) == 2
+e.httpx.get = real_get
+# F07: URL variants collapse, people without a URL stay distinct and count separately against --max-people
+LEADS["leads"][:] = [{"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", "linkedinUrl": "li/ann"}, {"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", "linkedinUrl": "LI/ann/"},
+                     {"firstName": "Bob", "lastName": "Ray", "title": "VP Sales"}, {"firstName": "Cy", "lastName": "Do", "title": "VP Sales"}]
+e.apify_jobs = lambda url, max_items=25: {"items": [{"title": f"J{i}", "company": {"linkedinUrl": LI}} for i in range(25)]}  # F01: capped, no total -> integer
+a9, ps9 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 2)
+assert a9["title_matches"] == 2 and [p["id"] for p in ps9] == ["li/ann", "acme.com|Bob|Ray"] and a9["jobs_total"] == 25
+# F14: an undisclosed round makes the total unknown (with a reason), not smaller; the last round still fills
+AVIATO["data"]["fundingRounds"].append({"announcedOn": "2024-01-01T00:00:00.000Z", "stage": "Series B"})
+e.deepline = lambda tool, payload, backend="deepline", check=None: {"raw": NOFUND} if tool == "crustdata_v3_company_search" else fake_deepline(tool, payload)
+a10, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
+assert a10["funding_total_usd"] is None and a10["funding_miss_reason"] == "undisclosed_amounts" and a10["last_round_type"] == "Series B"
+AVIATO["data"]["fundingRounds"].pop()
+# F09 + F08: a non-valid email is kept with a status reason and its real domain; an opt-out flag survives a phone miss
+EMAIL["data"].update(email="ann@other.test", status="invalid")
+e.deepline = fake_deepline
+e.bettercontact = lambda payload: {"raw": {"id": "r3", "status": "terminated", "data": [{"contact_phone_number": None, "do_not_contact": True}]}}
+_, ps11 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 1, mobile=True)
+assert ps11[0]["email"] == "ann@other.test" and ps11[0]["email_miss_reason"] == "status_invalid" and ps11[0]["email_domain"] == "other.test"
+assert ps11[0]["do_not_contact"] is True and ps11[0]["mobile_miss_reason"] == "no_mobile" and "mobile" not in ps11[0]
+EMAIL["data"].update(email="ann@acme.com", status="valid")
+# F02 + F15: without --mobile the mobile columns are not sent at all (never nulled); the same person under two domains is one upsert row
+writes.clear()
+e.db_write([a9, a9 | {"domain": "acme-old.com"}], ps9 + [ps9[0] | {"domain": "acme-old.com"}], "r2", mobile=False)
+prow = writes[1][1]; assert len(prow) == 2 and not (set(prow[0]) & set(e.MOBILE_COLS)) and prow[0]["domain"] == "acme-old.com"
+# F13 + F06: a wrong header exits before any network call and leaves prior outputs alone; --out-dir is created; a domain that raises still yields a row and the others export
+import sys
+out = Path(tempfile.mkdtemp()); Path(out, "accounts.csv").write_text("keep")
+Path(out, "bad.csv").write_text("website\nacme.com\n"); Path(out, "in.csv").write_text("domain\nacme.com\nboom.com\n")
+e.baseline = e.identify = lambda domains: {}
+e.enrich_domain = lambda d, *a, **k: (a9, ps9) if d == "acme.com" else (_ for _ in ()).throw(KeyError("shape"))
+sys.argv = ["enrich", "--input", str(out / "bad.csv"), "--titles", "ceo", "--out-dir", str(out)]
+try: e.main(); assert False
+except SystemExit as ex: assert "domain" in str(ex) and Path(out, "accounts.csv").read_text() == "keep"
+sys.argv = ["enrich", "--input", str(out / "in.csv"), "--titles", "ceo", "--out-dir", str(out / "nested" / "dir"), "--no-db"]
+e.main()
+lines = Path(out, "nested", "dir", "accounts.csv").read_text().splitlines()
+assert len(lines) == 3 and lines[1].startswith("acme.com,") and lines[2].startswith("boom.com,") and "exception:KeyError" in lines[2]
 print("ok")
