@@ -26,7 +26,8 @@ create table if not exists people (
   domain text not null references companies(domain) on delete cascade,
   company_name text, first_name text, last_name text, title text, linkedin_url text,
   email text, email_status text, email_domain text, mx_provider text, mx_security_gateway boolean, mx_gateway_type text, email_verified_at date, email_miss_reason text,
-  last_enriched_at timestamptz,          -- newest of the person's people-search page and email lookup; skip re-verifying inside your window
+  mobile text, mobile_cc text, mobile_status text, do_not_contact boolean, mobile_miss_reason text,   -- --mobile runs only; do_not_contact is the provider's opt-out flag, honour it
+  last_enriched_at timestamptz,          -- newest of the person's people-search page, email and mobile lookups; skip re-verifying inside your window
   run_id text,
   updated_at timestamptz not null default now()
 );
@@ -65,3 +66,7 @@ alter table people drop column if exists source;
 -- Migration 2026-09-25 (b): company-level mail gateway columns; people.mx_gateway replaced by the boolean (the name field also labels plain Google/Microsoft).
 alter table companies add column if not exists seg_vendor text, add column if not exists mailbox_provider text, add column if not exists mx_hosts text, add column if not exists seg_miss_reason text;
 alter table people drop column if exists mx_gateway, add column if not exists mx_security_gateway boolean;
+
+-- Migration 2026-09-25 (c): per-contact mobile columns for --mobile runs (idempotent).
+alter table people add column if not exists mobile text, add column if not exists mobile_cc text, add column if not exists mobile_status text,
+  add column if not exists do_not_contact boolean, add column if not exists mobile_miss_reason text;

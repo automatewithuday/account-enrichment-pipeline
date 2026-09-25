@@ -52,10 +52,11 @@ LEADS = {"leads": [{"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", 
 BW = {"data": {"Results": [{"Lookup": "acme.com", "Result": {"Paths": [{"Technologies": [{"Name": "React", "Tag": "js"}, {"Name": "React", "Tag": "js"}, {"Name": "jQuery", "LastDetected": 1000000000000}]}]}}]}}
 AVIATO = {"data": {"fundingRounds": [{"announcedOn": "2020-02-25T00:00:00.000Z", "moneyRaised": 306066, "stage": "Seed"}, {"announcedOn": "2022-05-04T00:00:00.000Z", "moneyRaised": 14300000, "stage": "Series A"}]}}
 EMAIL = {"data": {"email": "ann@acme.com", "status": "valid", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "processed_at": "2026-09-25T01:02:03Z"}}
+MOBILE = {"id": "req1", "status": "terminated", "data": [{"contact_phone_number": "+15550001234", "contact_phone_number_cc": "US", "contact_phone_number_status": "not_validated", "contact_phone_number_provider": "vendor-x", "do_not_contact": False, "contact_email_address": "other@acme.com"}]}
 def fake_deepline(tool, payload, backend="deepline"):
-    return {"raw": {"crustdata_v3_company_search": CRUST, "company_titles": {"titles": ["VP Sales", "Engineer"]},
+    return {"raw": {"crustdata_v3_company_search": CRUST, "bettercontact_enrich": MOBILE, "company_titles": {"titles": ["VP Sales", "Engineer"]},
                     "dropleads_search_people": LEADS, "builtwith_domain_lookup": BW, "aviato_get_company_funding_rounds": AVIATO, "leadmagic_email_finder": EMAIL}[tool]}
-e.deepline = fake_deepline
+real_deepline, e.deepline = e.deepline, fake_deepline
 e.apify_company = lambda url: {"items": [{"name": "Acme Inc", "employeeCount": 130, "employeeCountRange": {"start": 51, "end": 200},
     "industries": [{"name": "Software Development"}], "foundedOn": {"year": 2014}, "followerCount": 10, "companyType": "Privately Held",
     "locations": [{"city": "Denver", "geographicArea": "Colorado", "country": "US"}, {"city": "Austin", "geographicArea": "Texas", "country": "US", "headquarter": True}]}]}
@@ -76,6 +77,21 @@ assert a["seg_vendor"] == "mimecast" and a["mailbox_provider"] == "google" and "
 assert ps == [{"domain": "acme.com", "company_name": "Acme Inc", "first_name": "Ann", "last_name": "Lee", "title": "VP Sales", "linkedin_url": "li/ann", "source": "dropleads",
                "id": "li/ann", "last_enriched_at": None, "email": "ann@acme.com", "email_status": "valid", "email_domain": "acme.com", "mx_provider": "google workspace", "mx_security_gateway": False, "mx_gateway_type": "Cloud Mailbox Host", "email_verified_at": "2026-09-25"}]
 assert not any(k.endswith("miss_reason") for k in a)
+assert "mobile" not in ps[0] and "mobile_miss_reason" not in ps[0]  # mobile is opt-in
+# async launch: deepline() polls the free result endpoint until status=terminated and caches the terminal row under the launch key
+class R:
+    def __init__(s, body): s.status_code, s._b = 200, body
+    def json(s): return s._b
+polls = iter([{"toolResponse": {"raw": {"success": True, "id": "j1"}}, "billing": {"credits_charged": 7.55}},
+              {"toolResponse": {"raw": {"id": "j1", "status": "processing"}}},
+              {"toolResponse": {"raw": {"id": "j1", "status": "terminated", "data": [{"contact_phone_number": "+1"}]}}}])
+real_req, real_sleep, e.DL_KEY, e.HOST = e.request, e.time.sleep, "k", "http://h"
+e.request = lambda label, method, url, **kw: R(next(polls)); e.time.sleep = lambda s: None
+resp = real_deepline("bettercontact_enrich", {"first_name": "A", "last_name": "B", "wait_for_completion": False})
+assert resp["raw"]["status"] == "terminated" and resp["raw"]["data"][0]["contact_phone_number"] == "+1" and e.SPENT[-1][1] == 7.55, resp
+e.request, e.time.sleep = real_req, real_sleep
+_, psm = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5, mobile=True)
+assert psm[0]["mobile"] == "+15550001234" and psm[0]["mobile_cc"] == "US" and psm[0]["mobile_status"] == "not_validated" and psm[0]["mobile_source"] == "vendor-x" and psm[0]["do_not_contact"] is False and psm[0]["email"] == "ann@acme.com"
 a2, _ = e.enrich_domain("acme.com", ["vp sales"], {"acme.com": {"_shared": 40}}, {}, 5)
 assert a2["company_miss_reason"] == "shared_domain:40_companies" and a2["company_name"] == "Acme Inc"
 a3, _ = e.enrich_domain("other.com", ["vp sales"], {}, {"other.com": ("https://www.linkedin.com/company/other", 0.5)}, 5)
@@ -128,15 +144,17 @@ seen = []
 def fake_dropleads(tool, payload, backend="deepline"):
     if tool == "leadmagic_email_finder":
         seen.append("email:" + payload["domain"]); return {"raw": {"data": {"email": None, "message": "not found"}}}
+    if tool == "bettercontact_enrich":
+        seen.append("mobile:" + payload["company_domain"]); return {"raw": {"id": "r2", "status": "terminated", "data": [{"contact_phone_number": None}]}}
     if tool != "dropleads_search_people":
         return fake_deepline(tool, payload)
     dom = payload["filters"]["companyDomains"][0]; seen.append(dom)
     return {"raw": LEADS if dom == "acme-old.com" else {"leads": []}}
 e.deepline = fake_dropleads
-a4, ps4 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
-assert seen == ["acme.com", "acme-legacy.io", "acme-old.com", "email:acme-old.com"], seen  # email keyed by the alias, miss is free and carries a reason
+a4, ps4 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5, mobile=True)
+assert seen == ["acme.com", "acme-legacy.io", "acme-old.com", "email:acme-old.com", "mobile:acme-old.com"], seen  # email and mobile keyed by the alias, misses are free and carry a reason
 assert a4["title_matches"] == 1 and ps4[0]["source"] == "dropleads:acme-old.com" and "people_miss_reason" not in a4
-assert ps4[0]["email_miss_reason"] == "no_email" and "email" not in ps4[0]
+assert ps4[0]["email_miss_reason"] == "no_email" and "email" not in ps4[0] and ps4[0]["mobile_miss_reason"] == "no_mobile" and "mobile" not in ps4[0]
 
 # misses carry reasons; zero openings skips the paid jobs call
 e.deepline = lambda tool, payload, backend="deepline": {"error": "http_401"} if tool != "crustdata_v3_company_search" else {"raw": {"companies": [{"basic_info": {"name": "Z"}, "hiring": {"openings_count": 0}}]}}

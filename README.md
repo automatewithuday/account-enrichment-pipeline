@@ -33,6 +33,7 @@ domains.csv + "VP Sales,Chief Revenue,Founder,CEO"
 | Person | first_name, last_name, title, linkedin_url, source |
 | Email | email, email_status (verified live), email_domain, email_verified_at |
 | Mail routing | mx_provider, mx_security_gateway (true when a gateway sits in front), mx_gateway_type |
+| Mobile (`--mobile` only) | mobile, mobile_cc, mobile_status, do_not_contact (provider opt-out flag, honour it) |
 
 Rows are never dropped. Every blank data column has a sibling `*_miss_reason` that says why it is blank (`no_jobs`, `no_email`, `domain_mismatch:bit.ly`, `http_403`, ...).
 
@@ -84,6 +85,7 @@ Ten steps per domain, cheapest first. Each later step overwrites what an earlier
  8. titles at company        free   every title held at the company, your targets first
  9. people search            free   contacts matching your titles; tries legacy / alias domains when the input domain is empty
 10. email finder             paid   verified work email + per-person gateway flag, billed only on a hit
+11. mobile finder             paid   mobile number per contact, only with --mobile, billed only on a hit
 ```
 
 Every step runs against a provider you configure in `.env`. A missing provider key does not stop the run; the affected columns carry a miss reason.
@@ -95,9 +97,11 @@ Measured on real accounts. Reruns from cache are free.
 | Scenario | Per account |
 |---|---|
 | Full fresh intel card, two verified contacts | about $0.13 |
+| Same, with a mobile number for both contacts (`--mobile`) | about $1.64 |
 | Card only, no contacts | about $0.06 |
 | Card without tech stack | about $0.03 |
 | Each additional verified email | $0.034, nothing on a miss |
+| Each mobile number (`--mobile`) | $0.755 |
 
 Every provider response is cached in `.cache/calls.jsonl`, keyed by the exact request. Re-running a list costs nothing. `--max-age DAYS` re-fetches only responses older than DAYS, which is the knob for a periodic refresh. `--dry-run` prints every call that would be billed before you spend anything.
 
@@ -111,7 +115,7 @@ uv run python enrich.py --input sample.csv --titles "VP Sales,Chief Revenue" --d
 uv run python enrich.py --input sample.csv --titles "VP Sales,Chief Revenue"
 ```
 
-Options: `--limit N` (first N domains), `--max-people N` (contacts per company, default 5), `--max-age DAYS`, `--out-dir DIR`, `--no-db`. `DEBUG=1` logs every call to stderr.
+Options: `--limit N` (first N domains), `--max-people N` (contacts per company, default 5), `--mobile` (mobile number per contact, off by default), `--max-age DAYS`, `--out-dir DIR`, `--no-db`. `DEBUG=1` logs every call to stderr.
 
 ## Optional database
 
@@ -120,7 +124,7 @@ With `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` in `.env`, every run also upserts
 | Table | Key | Holds |
 |---|---|---|
 | companies | domain | the intel card, without provider names or cost columns, plus last_enriched_at |
-| people | profile URL | the contact rows with email and mail routing, foreign key to companies |
+| people | profile URL | the contact rows with email, mail routing and optional mobile, foreign key to companies |
 | raw_responses | request hash | one row per provider call with the full JSON response, fetch time and cost; re-fetching a step overwrites its row |
 
 `last_enriched_at` is the time a provider was actually fetched, not the time the CLI ran, so a cached rerun does not fake freshness. The database is a mirror: CSVs are written first and a database error never fails a run.
