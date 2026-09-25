@@ -85,7 +85,7 @@ Ten steps per domain, cheapest first. Each later step overwrites what an earlier
  8. titles at company        free   every title held at the company, your targets first
  9. people search            free   contacts matching your titles; tries legacy / alias domains when the input domain is empty
 10. email finder             paid   verified work email + per-person gateway flag, billed only on a hit
-11. mobile finder             paid   mobile number per contact, only with --mobile, billed only on a hit
+11. mobile finder             paid   mobile number per contact, only with --mobile; direct waterfall API, 10 provider credits per number found, nothing on a miss
 ```
 
 Every step runs against a provider you configure in `.env`. A missing provider key does not stop the run; the affected columns carry a miss reason.
@@ -97,7 +97,7 @@ Measured on real accounts. Reruns from cache are free.
 | Scenario | Per account |
 |---|---|
 | Full fresh intel card, two verified contacts | about $0.13 |
-| Same, with a mobile number for both contacts (`--mobile`) | about $1.64 |
+| Same, with a mobile number for both contacts (`--mobile`) | about $1.11 (10 phone-finder credits per number, $0.40 to $0.49 depending on plan) |
 | Card only, no contacts | about $0.06 |
 | Card without tech stack | about $0.03 |
 | Each additional verified email | $0.034, nothing on a miss |

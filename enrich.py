@@ -21,13 +21,15 @@ load_dotenv()
 HOST = os.getenv("DEEPLINE_HOST_URL", "").rstrip("/")
 DL_KEY = os.getenv("DEEPLINE_API_KEY")
 APIFY_TOKEN = os.getenv("APIFY_TOKEN")
+BC_KEY = os.getenv("BETTERCONTACT_API_KEY")
+BC_URL = "https://app.bettercontact.rocks/api/v2/async"
 DEBUG = os.getenv("DEBUG") == "1"
 SB_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SB_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 ACTOR = "harvestapi~linkedin-job-search"
 GATEWAY_MAP = json.loads((Path(__file__).parent / "gateway-map.json").read_text())  # MX suffixes -> security gateway / mailbox provider
 LI_COMPANY = re.compile(r"https?://(?:[a-z]{2,3}\.)?linkedin\.com/company/([A-Za-z0-9._%-]+)", re.I)
-PRICE_DL = {"crustdata_v3_company_search": 0.02, "leadmagic_email_finder": 0.34, "bettercontact_enrich": 7.55}  # credits per returned result; everything else free
+PRICE_DL = {"crustdata_v3_company_search": 0.02, "leadmagic_email_finder": 0.34}  # credits per returned result; everything else free
 CACHE_PATH = Path(".cache/calls.jsonl")
 CACHE: dict[str, dict] = {}
 SPENT: list[tuple[str, float, bool, float]] = []  # (backend, amount, from_cache, fetched_at epoch)
@@ -46,12 +48,11 @@ ACCOUNT_COLS = [
     "seg_vendor", "mailbox_provider", "mx_hosts", "seg_miss_reason",
     "funding_total_usd", "last_round_type", "last_round_amount_usd", "last_round_date", "investors", "funding_source", "funding_miss_reason",
     "tech_stack", "tech_stale", "tech_last_detected", "tech_miss_reason", "openings_count", "openings_growth_pct", "jobs_total", "jobs_newest_posted", "job_titles", "jobs_miss_reason",
-    "titles_at_company", "titles_miss_reason", "title_matches", "people_miss_reason", "crustdata_updated_at", "data_as_of", "deepline_cr", "apify_usd", "builtwith_cr",
+    "titles_at_company", "titles_miss_reason", "title_matches", "people_miss_reason", "crustdata_updated_at", "data_as_of", "deepline_cr", "apify_usd", "builtwith_cr", "bettercontact_cr",
 ]
 PEOPLE_COLS = ["domain", "company_name", "first_name", "last_name", "title", "linkedin_url", "source",
                "email", "email_status", "email_domain", "mx_provider", "mx_security_gateway", "mx_gateway_type", "email_verified_at", "email_miss_reason",
                "mobile", "mobile_cc", "mobile_status", "mobile_source", "do_not_contact", "mobile_miss_reason"]
-ASYNC_RESULT = {"bettercontact_enrich": "bettercontact_get_result"}  # tools whose launch can return status=running past the 30 s sync ceiling -> free poll endpoint
 
 
 def log(*a):
@@ -151,7 +152,7 @@ def db_upsert(table, rows, on_conflict):
     return n
 
 
-DB_HIDE = {"company_source", "linkedin_url_source", "funding_source", "crustdata_updated_at", "deepline_cr", "apify_usd", "builtwith_cr", "source", "mobile_source"}  # provider names stay in the CSVs and raw_responses, never on the demo tables
+DB_HIDE = {"company_source", "linkedin_url_source", "funding_source", "crustdata_updated_at", "deepline_cr", "apify_usd", "builtwith_cr", "bettercontact_cr", "source", "mobile_source"}  # provider names stay in the CSVs and raw_responses, never on the demo tables
 
 
 def db_write(accounts, people, run_id):
@@ -182,8 +183,8 @@ def deepline(tool, payload, backend="deepline"):
     def fn(key):
         if not DL_KEY:
             return {"error": "no_deepline_key"}
-        r = request(tool, "POST", f"{HOST}/api/v2/integrations/{tool}/execute", json={"payload": payload}, timeout=90,
-                    headers={"Authorization": f"Bearer {DL_KEY}"} | ({} if tool in ASYNC_RESULT else {"Idempotency-Key": key}))  # keyed async launches are refused with wait_for_completion=false
+        r = request(tool, "POST", f"{HOST}/api/v2/integrations/{tool}/execute", json={"payload": payload},
+                    headers={"Authorization": f"Bearer {DL_KEY}", "Idempotency-Key": key}, timeout=90)
         if r is None:
             return {"error": "http_5xx_exhausted"}
         if r.status_code >= 400:
@@ -192,20 +193,6 @@ def deepline(tool, payload, backend="deepline"):
         body = r.json()
         raw = get(body, "toolResponse.raw", "result")
         billing = body.get("billing")
-        for i in range(24):  # async job: launched with wait_for_completion=false (the platform's own sync wait misreads interim statuses as failure), poll the free result endpoint until terminated so the cached record under the launch key is the terminal row
-            status = str(get(raw, "status", "data.status") or "").lower()
-            if tool not in ASYNC_RESULT or status == "terminated":
-                break
-            if status in ("failed", "error", "cancelled"):
-                return {"error": f"async_{status}", "detail": json.dumps(raw)[:200], "_cost": get(billing or {}, "credits", "creditsCharged", "credits_charged", "amount") or 0.0}
-            time.sleep(5)
-            r2 = request(ASYNC_RESULT[tool], "POST", f"{HOST}/api/v2/integrations/{ASYNC_RESULT[tool]}/execute", json={"payload": {"request_id": get(raw, "id", "data.id")}},
-                         headers={"Authorization": f"Bearer {DL_KEY}", "Idempotency-Key": f"{key}:{i}"}, timeout=90)
-            if r2 is None or r2.status_code >= 400:
-                return {"error": "async_poll_" + ("http_5xx_exhausted" if r2 is None else f"http_{r2.status_code}"), "_cost": get(billing or {}, "credits", "creditsCharged", "credits_charged", "amount") or 0.0}
-            raw = get(r2.json(), "toolResponse.raw", "result")
-        else:
-            return {"error": "async_timeout", "_cost": get(billing or {}, "credits", "creditsCharged", "credits_charged", "amount") or 0.0}
         log(tool, r.status_code, billing, json.dumps(raw)[:700])
         cost = get(billing or {}, "credits", "creditsCharged", "credits_charged", "amount")
         if not isinstance(cost, (int, float)):
@@ -232,6 +219,30 @@ def apify(actor, payload, per_item_usd, start_usd=0.001, **params):
         log("apify", actor, r.status_code, len(items))
         return {"items": items, "_cost": start_usd + per_item_usd * len(items)}
     return cached("apify", actor, payload, fn)
+
+
+def bettercontact(payload):
+    """Direct waterfall phone finder: launch one contact, poll until terminated. 10 provider credits per phone found, nothing on a miss."""
+    def fn(key):
+        if not BC_KEY:
+            return {"error": "no_bettercontact_key"}
+        h = {"X-API-Key": BC_KEY}
+        r = request("bettercontact", "POST", BC_URL, json=payload, headers=h, timeout=60)
+        for i in range(25):  # 202 with no data while running; 200 + status=terminated when done
+            if r is None:
+                return {"error": "http_5xx_exhausted"}
+            if r.status_code >= 400:
+                log("bettercontact", r.status_code, r.text[:600])
+                return {"error": f"http_{r.status_code}", "detail": r.text[:200]}
+            raw = r.json()
+            if raw.get("status") == "terminated":
+                rows = raw.get("data") or []
+                log("bettercontact", r.status_code, json.dumps(raw)[:700])
+                return {"raw": raw, "_cost": 10 * sum(1 for x in rows if x.get("contact_phone_number"))}
+            time.sleep(5)
+            r = request("bettercontact", "GET", f"{BC_URL}/{raw.get('id')}", headers=h, timeout=60)
+        return {"error": "async_timeout"}
+    return cached("bettercontact", "async", payload, fn)
 
 
 def apify_jobs(linkedin_url, max_items=JOBS_MAX):
@@ -528,9 +539,9 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
                      mx_security_gateway=em.get("mx_security_gateway"), mx_gateway_type=em.get("mx_gateway_type"), email_verified_at=(em.get("processed_at") or "")[:10])
         else:
             r["email_miss_reason"] = resp.get("error") or "no_email"
-        if mobile:  # --mobile: waterfall phone finder, billed on a hit; the same call also returns an email which is ignored (the email step stays the email source)
-            payload = {"first_name": r["first_name"], "last_name": r["last_name"], "company_domain": dom, "enrich_phone_number": True, "wait_for_completion": False}
-            resp = deepline("bettercontact_enrich", payload | ({"linkedin_url": r["linkedin_url"]} if r.get("linkedin_url") else {}))
+        if mobile:  # --mobile: direct waterfall phone finder, phone only (no email credit), billed on a hit
+            contact = {"first_name": r["first_name"], "last_name": r["last_name"], "company_domain": dom} | ({"linkedin_url": r["linkedin_url"]} if r.get("linkedin_url") else {})
+            resp = bettercontact({"data": [contact], "enrich_email_address": False, "enrich_phone_number": True})
             row = (rows_of(resp.get("raw"), "data") or [{}])[0] if not resp.get("error") else {}
             if row.get("contact_phone_number"):
                 r.update(mobile=row["contact_phone_number"], mobile_cc=row.get("contact_phone_number_cc"), mobile_status=row.get("contact_phone_number_status"),
@@ -540,7 +551,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         own_ts = [ts for _, _, _, ts in SPENT[n:] if ts]
         r["last_enriched_at"] = iso(max(found_ts + own_ts)) if found_ts + own_ts else None  # newest fetch behind this person: their people-search page, email or mobile lookup
 
-    for backend, col in (("deepline", "deepline_cr"), ("apify", "apify_usd"), ("builtwith", "builtwith_cr")):
+    for backend, col in (("deepline", "deepline_cr"), ("apify", "apify_usd"), ("builtwith", "builtwith_cr"), ("bettercontact", "bettercontact_cr")):
         a[col] = round(sum(x for bk, x, _, _ in SPENT[start:] if bk == backend), 4)
     fetched = [ts for _, _, _, ts in SPENT[start:] if ts]
     a["data_as_of"] = time.strftime("%Y-%m-%d", time.gmtime(min(fetched))) if fetched else None  # oldest response behind this row
@@ -591,15 +602,16 @@ def main():
         print(f"DRY RUN: {len(domains)} domains, {len(PLANNED)} network calls planned (cached ones excluded):", file=sys.stderr)
         for p in sorted(set(PLANNED)):
             print(f"  {p} x{PLANNED.count(p)}", file=sys.stderr)
-        print(f"Estimate per domain: <=0.02 Deepline cr (+0.14 aviato only when crustdata has no funding) + <=${0.001 * (JOBS_MAX + 1):.3f} Apify ({JOBS_MAX} jobs) + ~1 BuiltWith credit + 0.34 cr per verified email (<= --max-people){' + 7.55 cr per mobile lookup (billed even when the platform reports the job failed)' if args.mobile else ''}", file=sys.stderr)
+        print(f"Estimate per domain: <=0.02 Deepline cr (+0.14 aviato only when crustdata has no funding) + <=${0.001 * (JOBS_MAX + 1):.3f} Apify ({JOBS_MAX} jobs) + ~1 BuiltWith credit + 0.34 cr per verified email (<= --max-people){' + 10 phone-finder credits per mobile found' if args.mobile else ''}", file=sys.stderr)
         return
     write_csvs(accounts, people, args.out_dir)
     dl = sum(x for bk, x, c, _ in SPENT if bk == "deepline" and not c)
     ap_usd = sum(x for bk, x, c, _ in SPENT if bk == "apify" and not c)
     bw = sum(x for bk, x, c, _ in SPENT if bk == "builtwith" and not c)
+    bc = sum(x for bk, x, c, _ in SPENT if bk == "bettercontact" and not c)
     db = "off" if args.no_db or not (SB_URL and SB_KEY) else db_write(accounts, people, time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
     print(f"Wrote accounts.csv ({len(accounts)}) and people.csv ({len(people)}). "
-          f"Run cost: Deepline {dl:.2f} cr | Apify ${ap_usd:.3f} | BuiltWith {bw:.2f} cr | {sum(1 for _, _, c, _ in SPENT if c)} cached calls | db: {db}", file=sys.stderr)
+          f"Run cost: Deepline {dl:.2f} cr | Apify ${ap_usd:.3f} | BuiltWith {bw:.2f} cr | Mobile {bc:.0f} cr | {sum(1 for _, _, c, _ in SPENT if c)} cached calls | db: {db}", file=sys.stderr)
 
 
 if __name__ == "__main__":
