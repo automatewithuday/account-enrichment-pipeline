@@ -231,8 +231,12 @@ def deepline(tool, payload, backend="deepline", check=None):
         if not isinstance(body, dict):
             return {"error": "bad_json"}
         raw = get(body, "toolResponse.raw", "result")
-        if raw is None:  # 200 with no result is the gateway's own error envelope; never cache it as an empty answer
-            return {"error": "no_result:" + str(body.get("error") or body.get("message") or "")[:80]}
+        if raw is None:  # get() skips empty values: an empty result is a real, cacheable miss; no result field at all is the gateway's own error envelope
+            tr = body.get("toolResponse") or {}
+            if "raw" in tr or "result" in body:
+                raw = tr["raw"] if "raw" in tr else body["result"]
+            else:
+                return {"error": "no_result:" + str(body.get("error") or body.get("message") or "")[:80]}
         if check and (err := check(raw)):
             return {"error": err}
         billing = body.get("billing")
@@ -478,11 +482,12 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
         resp = deepline("aviato_get_company_funding_rounds", {"website": d, "perPage": 20, "page": 0})  # ponytail: first 20 rounds only; paginate if a company ever has more
         all_rounds = rows_of(resp.get("raw"), "fundingRounds")
         rounds = [r for r in all_rounds if r.get("announcedOn")]
-        if rounds:
-            last = max(rounds, key=lambda r: r["announcedOn"])
+        if all_rounds:
             known = all(isinstance(r.get("moneyRaised"), (int, float)) for r in all_rounds)  # an undisclosed round (dated or not) makes the total unknown, not smaller
-            a.update({"funding_source": "aviato", "funding_total_usd": sum(r["moneyRaised"] for r in all_rounds) if known else None, "last_round_type": last.get("stage"),
-                      "last_round_amount_usd": last.get("moneyRaised"), "last_round_date": last["announcedOn"][:10]})
+            a.update({"funding_source": "aviato", "funding_total_usd": sum(r["moneyRaised"] for r in all_rounds) if known else None})
+            if rounds:  # the latest round needs a date; the total does not
+                last = max(rounds, key=lambda r: r["announcedOn"])
+                a.update({"last_round_type": last.get("stage"), "last_round_amount_usd": last.get("moneyRaised"), "last_round_date": last["announcedOn"][:10]})
             a.pop("funding_miss_reason", None)
             if not known:
                 a["funding_miss_reason"] = "undisclosed_amounts"
@@ -545,7 +550,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
             want = a["linkedin_url"].lower().rstrip("/")  # the company's LinkedIn URL is a stronger identity than its website (bit.ly links, legacy domains)
             items = [j for j in resp["items"] if (get(j, "company.linkedinUrl") or "").lower().rstrip("/") in ("", want)]  # drop wrong-company hits
             aliases.update(norm_domain(get(j, "company.website")) for j in items if get(j, "company.linkedinUrl"))  # only a verified company's site may seed the people search
-            total = get(resp["items"][0], "_meta.pagination.totalElements") if resp["items"] else None  # true 30-day count, all postings
+            total = get(items[0], "_meta.pagination.totalElements") if items else None  # true 30-day count for the queried company (same block on every item), read off a verified one
             if items:  # the provider total is only meaningful when at least one posting is verifiably this company's
                 a["jobs_total"] = total if isinstance(total, int) else len(items)  # integer always (schema column); a capped fetch without the total is a lower bound
             a["jobs_newest_posted"] = max(((j.get("postedDate") or "")[:10] for j in items), default=None) or None
@@ -603,7 +608,7 @@ def enrich_domain(d, titles, base, ident, max_people, mobile=False):
             contact = {"first_name": r["first_name"], "last_name": r["last_name"], "company_domain": dom} | ({"linkedin_url": r["linkedin_url"]} if r.get("linkedin_url") else {})
             resp = bettercontact({"data": [contact], "enrich_email_address": False, "enrich_phone_number": True})
             row = (rows_of(resp.get("raw"), "data") or [{}])[0] if not resp.get("error") else {}
-            r["mobile_checked"] = not resp.get("error")  # a failed lookup is inconclusive: its row is upserted without the mobile columns
+            r["mobile_checked"] = bool(row)  # conclusive only when a contact row came back; an error or an empty result leaves the stored mobile columns untouched
             if row.get("do_not_contact") is not None:
                 r["do_not_contact"] = row["do_not_contact"]  # the opt-out flag stands on its own, number or not
             if row.get("contact_phone_number"):

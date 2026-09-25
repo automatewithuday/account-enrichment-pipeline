@@ -27,7 +27,7 @@ create table if not exists people (
   company_name text, first_name text, last_name text, title text, linkedin_url text,
   email text, email_status text, email_domain text, mx_provider text, mx_security_gateway boolean, mx_gateway_type text, email_verified_at date, email_miss_reason text,
   mobile text, mobile_cc text, mobile_status text, do_not_contact boolean, mobile_miss_reason text,   -- --mobile runs only; do_not_contact is the provider's opt-out flag, honour it
-  last_enriched_at timestamptz,          -- newest of the person's people-search page, email and mobile lookups; skip re-verifying inside your window
+  last_enriched_at timestamptz,          -- newest fetch among the lookups the last run used for this row (people search, email, optional mobile); can move backwards on a partial rerun. Use email_verified_at to schedule email re-verification
   run_id text,
   updated_at timestamptz not null default now()
 );

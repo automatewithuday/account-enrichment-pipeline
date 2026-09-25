@@ -213,6 +213,10 @@ AVIATO["data"]["fundingRounds"] += [{"announcedOn": "2010-01-01T00:00:00.000Z", 
 a10b, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
 assert a10b["funding_total_usd"] == 14606084 and a10b["funding_miss_reason"] == "possibly_partial:20_rounds"
 del AVIATO["data"]["fundingRounds"][2:]
+AVIATO["data"]["fundingRounds"][:] = [{"moneyRaised": 100}, {"moneyRaised": 900}]  # undated only: the total is known, the latest round is not
+a10c, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
+assert a10c["funding_total_usd"] == 1000 and "last_round_date" not in a10c and "funding_miss_reason" not in a10c
+AVIATO["data"]["fundingRounds"][:] = [{"announcedOn": "2020-02-25T00:00:00.000Z", "moneyRaised": 306066, "stage": "Seed"}, {"announcedOn": "2022-05-04T00:00:00.000Z", "moneyRaised": 14300000, "stage": "Series A"}]
 # F09 + F08: a non-valid email is kept with a status reason and its real domain; an opt-out flag survives a phone miss
 EMAIL["data"].update(email="ann@other.test", status="invalid")
 e.deepline = fake_deepline
@@ -234,10 +238,20 @@ e.apify_jobs = lambda url, max_items=25: {"items": [{"title": "X", "company": {"
 LEADS["leads"][:] = [{"firstName": "Ann", "lastName": "Lee", "title": "VP Sales", "linkedinUrl": "LI/Ann/"}]
 a12, ps12 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
 assert "jobs_total" not in a12 and a12["jobs_miss_reason"] == "company_mismatch" and ps12[0]["id"] == "li/ann"
+e.apify_jobs = lambda url, max_items=25: {"items": [{"title": "X", "company": {"linkedinUrl": "https://www.linkedin.com/company/other"}, "_meta": {"pagination": {"totalElements": 70}}},
+                                                    {"title": "AE", "company": {"linkedinUrl": LI}, "_meta": {"pagination": {"totalElements": 3}}}]}
+a12b, _ = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 5)
+assert a12b["jobs_total"] == 3 and a12b["job_titles"] == "AE"  # the total is read off a verified item
+# an empty completed phone response is inconclusive: the row goes out without the mobile columns
+e.bettercontact = lambda payload: {"raw": {"id": "r4", "status": "terminated", "data": []}}
+_, ps13 = e.enrich_domain("acme.com", ["vp sales"], {}, {}, 1, mobile=True)
+assert ps13[0]["mobile_checked"] is False and ps13[0]["mobile_miss_reason"] == "no_mobile"
 # residual: a 200 with no result is the gateway's error envelope, never cached as an empty answer; launches never retry a 5xx, only 429
 e.deepline, hits[:] = real_deepline, []
 e.request = lambda *a, **k: (hits.append(1), R(200, {"error": "upstream quota exceeded"}))[1]
 assert real_deepline("company_titles", {"domain": "q.test"})["error"].startswith("no_result:upstream") and real_deepline("company_titles", {"domain": "q.test"})["error"] and len(hits) == 2
+e.request = lambda *a, **k: (hits.append(1), R(200, {"result": []}))[1]  # an empty result is a real miss: cached, fetched once
+assert real_deepline("company_titles", {"domain": "e.test"})["raw"] == [] and real_deepline("company_titles", {"domain": "e.test"})["raw"] == [] and len(hits) == 3
 e.request, e.deepline = real_req, fake_deepline
 codes = iter([500, 200]); e.httpx.request = lambda *a, **k: R(next(codes), {}, "err")
 assert e.request("bc", "POST", "u", launch=True).status_code == 500 and next(codes) == 200
